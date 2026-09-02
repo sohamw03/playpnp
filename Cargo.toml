@@ -1,0 +1,60 @@
+[package]
+name = "playpnp"
+version = "0.1.0"
+edition = "2024"
+description = "DLNA MediaRenderer for Windows - headless tray daemon controllable via BubbleUPnP"
+authors = []
+license = "MIT"
+readme = "README.md"
+keywords = ["dlna", "upnp", "mediarenderer", "vlc", "media"]
+categories = ["multimedia"]
+
+[[bin]]
+name = "playpnp"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.48", features = ["full"] }
+axum = { version = "0.8", features = ["json"] }
+hyper = { version = "1.7", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+socket2 = "0.6"
+quick-xml = { version = "0.42", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+local-ip-address = "0.6"
+if-addrs = "0.13"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+http-body-util = "0.1"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+sysinfo = "0.33"
+
+# Tray daemon (Windows)
+tray-icon = { version = "0.24", optional = true }
+winit = { version = "0.30", optional = true }
+muda = { version = "0.19", optional = true }
+
+# Windows Media Foundation / player helpers (optional)
+# vlc-rs is optional - only needed if VLC SDK present
+# windows crate for advanced WMP/MF if needed
+windows = { version = "0.62", optional = true, features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
+
+[features]
+default = ["tray"]
+tray = ["dep:tray-icon", "dep:winit", "dep:muda"]
+native-mf = ["dep:windows"]
+with-vlc = []
+
+[profile.release]
+lto = "thin"
+strip = true
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
