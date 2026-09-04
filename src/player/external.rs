@@ -19,6 +19,9 @@ pub struct VlcPlayer {
     volume: u8,
     mute: bool,
     transition_start: Option<Instant>,
+    subtitles_checked: bool,
+    audio_checked: bool,
+    stopped_at: Option<Instant>,
 }
 
 impl VlcPlayer {
@@ -38,6 +41,9 @@ impl VlcPlayer {
             volume: 100,
             mute: false,
             transition_start: None,
+            subtitles_checked: false,
+            audio_checked: false,
+            stopped_at: None,
         }
     }
 
@@ -87,6 +93,8 @@ impl VlcPlayer {
                 &format!("127.0.0.1:{}", port),
                 "--rc-quiet",
                 "--no-video-title-show",
+                "--fullscreen",
+                "--audio-language=en,eng,English",
                 // Hardware acceleration for video decoding on Windows (Direct3D11 / DXVA2)
                 "--avcodec-hw=any",
                 // Enhanced buffering and resilience for weak Wi-Fi / lossy connections
@@ -150,7 +158,8 @@ impl VlcPlayer {
                         Ok(0) => break,
                         Ok(_) => {
                             let trimmed = line.trim().to_string();
-                            let command_finished = trimmed.starts_with("status: returned");
+                            let command_finished = trimmed.starts_with("status: returned")
+                                || trimmed.contains("end of stream info");
                             if !trimmed.is_empty() {
                                 let is_digit_answer = trimmed.chars().all(|c| c.is_ascii_digit());
                                 responses.push(trimmed);
@@ -200,11 +209,16 @@ impl VlcPlayer {
     }
 
     fn disconnect(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+        }
         self.rc_stream = None;
         self.loaded_uri = None;
         self.pending_seek = None;
         self.state = PlaybackState::Stopped;
         self.transition_start = None;
+        self.subtitles_checked = false;
+        self.audio_checked = false;
     }
 
     fn poll_sync_internal(&mut self) {
@@ -231,10 +245,15 @@ impl VlcPlayer {
         let reported_state = parse_vlc_state(&status_res);
         let active = parse_rc_bool(&active_res);
 
-        // Account for weak Wi-Fi: allow up to 35 seconds for initial connection & buffer fill
+        // Allow up to 35 seconds for initial connection & buffer fill
         let transition_timed_out = self
             .transition_start
             .map(|start| start.elapsed() > Duration::from_secs(35))
+            .unwrap_or(false);
+        // During the first 3 seconds of a new track loading, ignore transient "stopped" lines from VLC
+        let just_started_transition = self
+            .transition_start
+            .map(|start| start.elapsed() < Duration::from_secs(3))
             .unwrap_or(false);
 
         let next_state = match (reported_state, active) {
@@ -258,9 +277,19 @@ impl VlcPlayer {
             }
             (Some(PlaybackState::Playing), Some(true)) => Some(PlaybackState::Playing),
             (Some(PlaybackState::Paused), Some(true)) => Some(PlaybackState::Paused),
-            (Some(PlaybackState::Stopped), Some(false) | None) => Some(PlaybackState::Stopped),
+            (Some(PlaybackState::Stopped), Some(false) | None) => {
+                if self.state == PlaybackState::Transitioning && just_started_transition {
+                    Some(PlaybackState::Transitioning)
+                } else {
+                    Some(PlaybackState::Stopped)
+                }
+            }
             (Some(PlaybackState::Playing | PlaybackState::Paused), Some(false)) => {
-                Some(PlaybackState::Stopped)
+                if self.state == PlaybackState::Transitioning && just_started_transition {
+                    Some(PlaybackState::Transitioning)
+                } else {
+                    Some(PlaybackState::Stopped)
+                }
             }
             (Some(state), None) => Some(state),
             (None, Some(false)) => {
@@ -283,10 +312,71 @@ impl VlcPlayer {
                 tracing::info!("VLC state changed: {:?} -> {:?}", self.state, state);
                 if state == PlaybackState::Playing {
                     self.transition_start = None;
+                    self.stopped_at = None;
                     self.last_pos_time = Instant::now();
+                } else if state == PlaybackState::Transitioning {
+                    self.stopped_at = None;
+                    self.subtitles_checked = false;
+                    self.audio_checked = false;
+                } else if state == PlaybackState::Stopped {
+                    self.stopped_at = Some(Instant::now());
                 }
             }
             self.state = state;
+        }
+
+        // Close VLC if it has been continuously stopped/idle for over 3 seconds
+        if self.state == PlaybackState::Stopped {
+            if let Some(stopped_at) = self.stopped_at {
+                if stopped_at.elapsed() > Duration::from_secs(3) {
+                    tracing::info!("VLC idle for >3s, closing player");
+                    let _ = self.send_cmd_fire_and_forget("quit");
+                    if let Some(mut child) = self.child.take() {
+                        let _ = child.kill();
+                    }
+                    self.rc_stream = None;
+                    self.loaded_uri = None;
+                    self.pending_seek = None;
+                    self.transition_start = None;
+                    self.stopped_at = None;
+                    self.subtitles_checked = false;
+                    self.audio_checked = false;
+                }
+            }
+        }
+
+        // Also check if VLC reported a new input in status lines (track changed)
+        for line in &status_res {
+            if line.to_ascii_lowercase().contains("new input:") {
+                self.subtitles_checked = false;
+                self.audio_checked = false;
+            }
+        }
+
+        // Search for subtitles: primarily 'sdh' + 'english', then 'english'; otherwise do not set.
+        if self.state == PlaybackState::Playing && !self.subtitles_checked {
+            let strack_res = self.send_cmd("strack");
+            if let Some(track_id) = find_best_subtitle_track(&strack_res) {
+                tracing::info!("Auto-selected subtitle track: {}", track_id);
+                self.send_cmd_fire_and_forget(&format!("strack {}", track_id));
+                self.subtitles_checked = true;
+            } else if !strack_res.is_empty() {
+                tracing::info!("No matching SDH/English subtitle track found; leaving disabled");
+                self.subtitles_checked = true;
+            }
+        }
+
+        // Search for audio: find track with 'eng' or 'english' and apply it
+        if self.state == PlaybackState::Playing && !self.audio_checked {
+            let atrack_res = self.send_cmd("atrack");
+            if let Some(track_id) = find_best_audio_track(&atrack_res) {
+                tracing::info!("Auto-selected English audio track: {}", track_id);
+                self.send_cmd_fire_and_forget(&format!("atrack {}", track_id));
+                self.audio_checked = true;
+            } else if !atrack_res.is_empty() {
+                tracing::info!("No English audio track found; leaving default");
+                self.audio_checked = true;
+            }
         }
 
         // Read the actual clock even when paused or buffering.  Never
@@ -420,6 +510,8 @@ impl MediaPlayer for VlcPlayer {
         self.pending_seek = None;
         self.state = PlaybackState::Stopped;
         self.transition_start = None;
+        self.subtitles_checked = false;
+        self.audio_checked = false;
     }
 
     fn play(&mut self) -> anyhow::Result<()> {
@@ -457,7 +549,10 @@ impl MediaPlayer for VlcPlayer {
                 self.loaded_uri = Some(self.uri.clone());
                 self.state = PlaybackState::Transitioning;
                 self.transition_start = Some(Instant::now());
+                self.stopped_at = None;
                 self.last_pos_time = Instant::now();
+                self.subtitles_checked = false;
+                self.audio_checked = false;
 
                 if let Some((target, _)) = self.pending_seek {
                     let _ = self.send_cmd_fire_and_forget(&format!("seek {}", target.as_secs()));
@@ -484,14 +579,17 @@ impl MediaPlayer for VlcPlayer {
     fn stop(&mut self) -> anyhow::Result<()> {
         tracing::info!("VlcPlayer stopping playback");
         if self.rc_stream.is_some() {
-            self.send_cmd_fire_and_forget("stop");
+            let _ = self.send_cmd_fire_and_forget("stop");
         }
         self.state = PlaybackState::Stopped;
+        self.stopped_at = Some(Instant::now());
         self.position = Duration::from_secs(0);
         self.last_pos_time = Instant::now();
         self.pending_seek = None;
         self.loaded_uri = None;
         self.transition_start = None;
+        self.subtitles_checked = false;
+        self.audio_checked = false;
         Ok(())
     }
 
@@ -577,6 +675,55 @@ impl Drop for VlcPlayer {
     }
 }
 
+pub fn find_best_subtitle_track(lines: &[String]) -> Option<i32> {
+    let mut sdh_english = None;
+    let mut english = None;
+
+    for line in lines {
+        let trimmed = line.trim();
+        let clean = trimmed.strip_prefix('|').unwrap_or(trimmed).trim();
+        if let Some((id_str, desc)) = clean.split_once(" - ") {
+            let id_clean = id_str.trim().trim_matches('*').trim();
+            if let Ok(id) = id_clean.parse::<i32>() {
+                if id < 0 {
+                    continue; // Skip "-1 - Disable"
+                }
+                let desc_lower = desc.to_lowercase();
+                let is_eng = desc_lower.contains("english") || desc_lower.contains("eng");
+                let is_sdh = desc_lower.contains("sdh");
+
+                if is_sdh && is_eng && sdh_english.is_none() {
+                    sdh_english = Some(id);
+                } else if is_eng && english.is_none() {
+                    english = Some(id);
+                }
+            }
+        }
+    }
+
+    sdh_english.or(english)
+}
+
+pub fn find_best_audio_track(lines: &[String]) -> Option<i32> {
+    for line in lines {
+        let trimmed = line.trim();
+        let clean = trimmed.strip_prefix('|').unwrap_or(trimmed).trim();
+        if let Some((id_str, desc)) = clean.split_once(" - ") {
+            let id_clean = id_str.trim().trim_matches('*').trim();
+            if let Ok(id) = id_clean.parse::<i32>() {
+                if id < 0 {
+                    continue; // Skip "-1 - Disable"
+                }
+                let desc_lower = desc.to_lowercase();
+                if desc_lower.contains("english") || desc_lower.contains("eng") {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +778,62 @@ mod tests {
         // Extrapolation must be capped under 1s (10s + 950ms) rather than drifting to 15s
         assert!(pos <= Duration::from_millis(10950));
         assert!(pos >= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_find_best_subtitle_track() {
+        // Case 1: Both SDH English and regular English -> choose SDH English
+        let sample_both = lines(&[
+            "+----[ Subtitles track ]",
+            "| -1 - Disable",
+            "| 1 - English [eng]",
+            "| 2 - English (SDH) [eng]",
+            "| 3 - Spanish [spa]",
+            "+----[ end of stream info ]",
+        ]);
+        assert_eq!(find_best_subtitle_track(&sample_both), Some(2));
+
+        // Case 2: Only regular English -> choose English
+        let sample_eng_only = lines(&[
+            "+----[ Subtitles track ]",
+            "| -1 - Disable",
+            "| 1* - English [eng]",
+            "| 2 - French [fre]",
+            "+----[ end of stream info ]",
+        ]);
+        assert_eq!(find_best_subtitle_track(&sample_eng_only), Some(1));
+
+        // Case 3: No English at all -> choose None (do not set)
+        let sample_no_eng = lines(&[
+            "+----[ Subtitles track ]",
+            "| -1 - Disable",
+            "| 1 - Spanish [spa]",
+            "| 2 - Japanese [jpn]",
+            "+----[ end of stream info ]",
+        ]);
+        assert_eq!(find_best_subtitle_track(&sample_no_eng), None);
+    }
+
+    #[test]
+    fn test_find_best_audio_track() {
+        // Case 1: Multiple audio tracks with English
+        let sample = lines(&[
+            "+----[ Audio track ]",
+            "| -1 - Disable",
+            "| 1 - Hindi [hin]",
+            "| 2* - English [eng]",
+            "| 3 - Spanish [spa]",
+            "+----[ end of stream info ]",
+        ]);
+        assert_eq!(find_best_audio_track(&sample), Some(2));
+
+        // Case 2: No English audio track -> returns None
+        let sample_no_eng = lines(&[
+            "+----[ Audio track ]",
+            "| -1 - Disable",
+            "| 1 - Japanese [jpn]",
+            "+----[ end of stream info ]",
+        ]);
+        assert_eq!(find_best_audio_track(&sample_no_eng), None);
     }
 }
