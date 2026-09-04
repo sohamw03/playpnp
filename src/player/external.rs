@@ -18,6 +18,7 @@ pub struct VlcPlayer {
     state: PlaybackState,
     volume: u8,
     mute: bool,
+    transition_start: Option<Instant>,
 }
 
 impl VlcPlayer {
@@ -36,6 +37,7 @@ impl VlcPlayer {
             state: PlaybackState::Stopped,
             volume: 100,
             mute: false,
+            transition_start: None,
         }
     }
 
@@ -49,6 +51,7 @@ impl VlcPlayer {
                 self.loaded_uri = None;
                 self.pending_seek = None;
                 self.state = PlaybackState::Stopped;
+                self.transition_start = None;
             }
         }
 
@@ -84,6 +87,14 @@ impl VlcPlayer {
                 &format!("127.0.0.1:{}", port),
                 "--rc-quiet",
                 "--no-video-title-show",
+                // Hardware acceleration for video decoding on Windows (Direct3D11 / DXVA2)
+                "--avcodec-hw=any",
+                // Enhanced buffering and resilience for weak Wi-Fi / lossy connections
+                "--network-caching=5000",
+                "--file-caching=3000",
+                "--live-caching=3000",
+                "--http-reconnect",
+                "--clock-jitter=5000",
             ])
             .spawn()
         {
@@ -113,8 +124,8 @@ impl VlcPlayer {
         let addr = format!("127.0.0.1:{}", self.rc_port);
         for _ in 0..5 {
             if let Ok(stream) = TcpStream::connect(&addr) {
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
                 self.rc_stream = Some(BufReader::new(stream));
                 return true;
             }
@@ -126,6 +137,7 @@ impl VlcPlayer {
     fn send_cmd(&mut self, cmd: &str) -> Vec<String> {
         let mut responses = Vec::new();
         let mut failed = false;
+        let is_single_line = matches!(cmd, "is_playing" | "get_time" | "get_length");
         if let Some(reader) = self.rc_stream.as_mut() {
             let msg = format!("{}\n", cmd);
             let stream = reader.get_mut();
@@ -140,7 +152,14 @@ impl VlcPlayer {
                             let trimmed = line.trim().to_string();
                             let command_finished = trimmed.starts_with("status: returned");
                             if !trimmed.is_empty() {
+                                let is_digit_answer = trimmed.chars().all(|c| c.is_ascii_digit());
                                 responses.push(trimmed);
+                                // For single-line numeric queries (get_time, get_length, is_playing),
+                                // return immediately once the numeric response arrives instead of
+                                // waiting for socket read timeouts.
+                                if is_single_line && is_digit_answer {
+                                    break;
+                                }
                             }
                             line.clear();
                             if command_finished {
@@ -167,14 +186,28 @@ impl VlcPlayer {
         responses
     }
 
+    /// Send a write-only command without blocking on read timeouts (VLC RC does not reply to write commands)
+    fn send_cmd_fire_and_forget(&mut self, cmd: &str) -> bool {
+        if let Some(reader) = self.rc_stream.as_mut() {
+            let msg = format!("{}\n", cmd);
+            let stream = reader.get_mut();
+            if stream.write_all(msg.as_bytes()).is_ok() && stream.flush().is_ok() {
+                return true;
+            }
+        }
+        self.rc_stream = None;
+        false
+    }
+
     fn disconnect(&mut self) {
         self.rc_stream = None;
         self.loaded_uri = None;
         self.pending_seek = None;
         self.state = PlaybackState::Stopped;
+        self.transition_start = None;
     }
 
-    pub fn poll_sync(&mut self) {
+    fn poll_sync_internal(&mut self) {
         // VLC is authoritative.  Poll while paused/stopped as well so a
         // click in VLC's own window is reflected in the DLNA state.
         if self.rc_stream.is_none() {
@@ -197,7 +230,23 @@ impl VlcPlayer {
         let previous_position = self.position;
         let reported_state = parse_vlc_state(&status_res);
         let active = parse_rc_bool(&active_res);
+
+        // Account for weak Wi-Fi: allow up to 35 seconds for initial connection & buffer fill
+        let transition_timed_out = self
+            .transition_start
+            .map(|start| start.elapsed() > Duration::from_secs(35))
+            .unwrap_or(false);
+
         let next_state = match (reported_state, active) {
+            // While VLC is opening or buffering (state: 1 or 2), is_playing is 0.
+            // Never treat buffering as Stopped!
+            (Some(PlaybackState::Transitioning), _) => {
+                if transition_timed_out {
+                    Some(PlaybackState::Stopped)
+                } else {
+                    Some(PlaybackState::Transitioning)
+                }
+            }
             (Some(PlaybackState::Stopped), Some(true)) => {
                 // `is_playing=1` means VLC still has an active item (including
                 // paused input), so a stale stopped event cannot override it.
@@ -207,13 +256,22 @@ impl VlcPlayer {
                     PlaybackState::Playing
                 })
             }
-            (Some(state), Some(true)) => Some(state),
-            (Some(PlaybackState::Stopped), Some(false)) => Some(PlaybackState::Stopped),
-            (Some(PlaybackState::Playing), Some(false)) => Some(PlaybackState::Stopped),
-            (Some(PlaybackState::Paused), Some(false)) => Some(PlaybackState::Stopped),
-            (Some(PlaybackState::Transitioning), Some(false)) => Some(PlaybackState::Stopped),
+            (Some(PlaybackState::Playing), Some(true)) => Some(PlaybackState::Playing),
+            (Some(PlaybackState::Paused), Some(true)) => Some(PlaybackState::Paused),
+            (Some(PlaybackState::Stopped), Some(false) | None) => Some(PlaybackState::Stopped),
+            (Some(PlaybackState::Playing | PlaybackState::Paused), Some(false)) => {
+                Some(PlaybackState::Stopped)
+            }
             (Some(state), None) => Some(state),
-            (None, Some(false)) => Some(PlaybackState::Stopped),
+            (None, Some(false)) => {
+                // When loading over weak Wi-Fi, status may not emit a new state line each tick.
+                // Keep Transitioning during the loading grace period instead of prematurely stopping.
+                if self.state == PlaybackState::Transitioning && !transition_timed_out {
+                    Some(PlaybackState::Transitioning)
+                } else {
+                    Some(PlaybackState::Stopped)
+                }
+            }
             (None, Some(true)) if self.state == PlaybackState::Paused => {
                 Some(PlaybackState::Paused)
             }
@@ -223,6 +281,10 @@ impl VlcPlayer {
         if let Some(state) = next_state {
             if self.state != state {
                 tracing::info!("VLC state changed: {:?} -> {:?}", self.state, state);
+                if state == PlaybackState::Playing {
+                    self.transition_start = None;
+                    self.last_pos_time = Instant::now();
+                }
             }
             self.state = state;
         }
@@ -253,6 +315,13 @@ impl VlcPlayer {
                     // During network rebuffering VLC can briefly report zero
                     // (or an old timestamp). Preserve the last known clock
                     // instead of making the controller jump backwards.
+                    false
+                }
+                _ if sample == Duration::ZERO
+                    && previous_position > Duration::from_secs(3)
+                    && !seek_is_settling =>
+                {
+                    // Ignore spurious 0s when VLC reconnects stream over weak Wi-Fi
                     false
                 }
                 _ => true,
@@ -338,8 +407,8 @@ impl MediaPlayer for VlcPlayer {
         // A SetAVTransportURI is a replacement, not just metadata.  Clear
         // VLC's old playlist so a later Play can never resume the old item.
         if self.uri != uri && self.rc_stream.is_some() {
-            let _ = self.send_cmd("stop");
-            let _ = self.send_cmd("clear");
+            let _ = self.send_cmd_fire_and_forget("stop");
+            let _ = self.send_cmd_fire_and_forget("clear");
         }
 
         self.uri = uri;
@@ -350,6 +419,7 @@ impl MediaPlayer for VlcPlayer {
         self.last_pos_time = Instant::now();
         self.pending_seek = None;
         self.state = PlaybackState::Stopped;
+        self.transition_start = None;
     }
 
     fn play(&mut self) -> anyhow::Result<()> {
@@ -361,19 +431,11 @@ impl MediaPlayer for VlcPlayer {
             anyhow::bail!("VLC is not available");
         }
 
-        self.poll_sync();
-        if self.rc_stream.is_none() {
-            anyhow::bail!("VLC remote-control connection was lost");
-        }
-
         match self.state {
             PlaybackState::Paused => {
                 tracing::info!("VlcPlayer resuming playback");
-                // `pause` is a toggle in VLC's RC interface. `play` resumes
-                // the current playlist item without inverting an already
-                // playing state.
-                self.send_cmd("pause");
-                if self.rc_stream.is_none() {
+                // `pause` is a toggle in VLC's RC interface.
+                if !self.send_cmd_fire_and_forget("pause") {
                     self.disconnect();
                     anyhow::bail!("VLC remote-control connection was lost");
                 }
@@ -383,23 +445,22 @@ impl MediaPlayer for VlcPlayer {
             PlaybackState::Playing | PlaybackState::Transitioning
                 if self.loaded_uri.as_deref() == Some(self.uri.as_str()) =>
             {
-                // Play is idempotent.  In particular, never implement it as
-                // a blind VLC `pause` toggle when VLC is already playing.
+                // Play is idempotent.
             }
             _ => {
                 tracing::info!("VlcPlayer starting playback for {}", self.uri);
-                self.send_cmd("clear");
-                self.send_cmd(&format!("add {}", self.uri));
-                if self.rc_stream.is_none() {
+                let _ = self.send_cmd_fire_and_forget("clear");
+                if !self.send_cmd_fire_and_forget(&format!("add {}", self.uri)) {
                     self.disconnect();
                     anyhow::bail!("VLC remote-control connection was lost");
                 }
                 self.loaded_uri = Some(self.uri.clone());
-                self.state = PlaybackState::Playing;
+                self.state = PlaybackState::Transitioning;
+                self.transition_start = Some(Instant::now());
                 self.last_pos_time = Instant::now();
 
                 if let Some((target, _)) = self.pending_seek {
-                    self.send_cmd(&format!("seek {}", target.as_secs()));
+                    let _ = self.send_cmd_fire_and_forget(&format!("seek {}", target.as_secs()));
                     self.pending_seek = Some((target, Instant::now()));
                 }
             }
@@ -408,13 +469,9 @@ impl MediaPlayer for VlcPlayer {
     }
 
     fn pause(&mut self) -> anyhow::Result<()> {
-        if self.rc_stream.is_some() {
-            self.poll_sync();
-        }
         if self.state == PlaybackState::Playing || self.state == PlaybackState::Transitioning {
             tracing::info!("VlcPlayer pausing playback");
-            self.send_cmd("pause");
-            if self.rc_stream.is_none() {
+            if !self.send_cmd_fire_and_forget("pause") {
                 self.disconnect();
                 anyhow::bail!("VLC remote-control connection was lost");
             }
@@ -427,16 +484,14 @@ impl MediaPlayer for VlcPlayer {
     fn stop(&mut self) -> anyhow::Result<()> {
         tracing::info!("VlcPlayer stopping playback");
         if self.rc_stream.is_some() {
-            self.send_cmd("stop");
-            if self.rc_stream.is_none() {
-                self.disconnect();
-            }
+            self.send_cmd_fire_and_forget("stop");
         }
         self.state = PlaybackState::Stopped;
         self.position = Duration::from_secs(0);
         self.last_pos_time = Instant::now();
         self.pending_seek = None;
         self.loaded_uri = None;
+        self.transition_start = None;
         Ok(())
     }
 
@@ -451,8 +506,7 @@ impl MediaPlayer for VlcPlayer {
         };
         tracing::info!("VlcPlayer seek to {}s", target.as_secs());
         if self.rc_stream.is_some() {
-            self.send_cmd(&format!("seek {}", target.as_secs()));
-            if self.rc_stream.is_none() {
+            if !self.send_cmd_fire_and_forget(&format!("seek {}", target.as_secs())) {
                 self.disconnect();
                 anyhow::bail!("VLC remote-control connection was lost");
             }
@@ -467,7 +521,7 @@ impl MediaPlayer for VlcPlayer {
         self.volume = vol.min(100);
         let vlc_vol = (self.volume as u32 * 256) / 100;
         tracing::info!("VlcPlayer set_volume {}% (vlc: {})", self.volume, vlc_vol);
-        self.send_cmd(&format!("volume {}", vlc_vol));
+        self.send_cmd_fire_and_forget(&format!("volume {}", vlc_vol));
         Ok(())
     }
 
@@ -475,18 +529,22 @@ impl MediaPlayer for VlcPlayer {
         self.mute = mute;
         tracing::info!("VlcPlayer set_mute {}", mute);
         if mute {
-            self.send_cmd("volume 0");
+            self.send_cmd_fire_and_forget("volume 0");
         } else {
             let vlc_vol = (self.volume as u32 * 256) / 100;
-            self.send_cmd(&format!("volume {}", vlc_vol));
+            self.send_cmd_fire_and_forget(&format!("volume {}", vlc_vol));
         }
         Ok(())
     }
 
     fn get_position(&self) -> (Duration, Duration) {
         if self.state == PlaybackState::Playing {
-            let elapsed = self.last_pos_time.elapsed();
-            let estimated = self.position + elapsed;
+            // Cap subsecond extrapolation to 950ms.
+            // On weak Wi-Fi connections, network stalls or packet delays must
+            // never cause the estimated timeline to race ahead of what VLC
+            // is actually rendering, preventing timeline jumps and desync.
+            let subsecond = self.last_pos_time.elapsed().min(Duration::from_millis(950));
+            let estimated = self.position + subsecond;
             if self.duration.as_secs() > 0 && estimated > self.duration {
                 (self.duration, self.duration)
             } else {
@@ -504,11 +562,15 @@ impl MediaPlayer for VlcPlayer {
     fn current_uri(&self) -> String {
         self.uri.clone()
     }
+
+    fn poll_sync(&mut self) {
+        self.poll_sync_internal();
+    }
 }
 
 impl Drop for VlcPlayer {
     fn drop(&mut self) {
-        let _ = self.send_cmd("quit");
+        let _ = self.send_cmd_fire_and_forget("quit");
         if let Some(ref mut child) = self.child {
             let _ = child.kill();
         }
@@ -554,5 +616,20 @@ mod tests {
             Some(PlaybackState::Playing)
         );
         assert_eq!(parse_vlc_state(&lines(&["unknown response"])), None);
+    }
+
+    #[test]
+    fn test_position_capped_during_stall() {
+        let mut player = VlcPlayer::new();
+        player.state = PlaybackState::Playing;
+        player.position = Duration::from_secs(10);
+        player.duration = Duration::from_secs(100);
+        // Simulate a 5-second Wi-Fi stall/rebuffering
+        player.last_pos_time = Instant::now() - Duration::from_secs(5);
+
+        let (pos, _) = player.get_position();
+        // Extrapolation must be capped under 1s (10s + 950ms) rather than drifting to 15s
+        assert!(pos <= Duration::from_millis(10950));
+        assert!(pos >= Duration::from_secs(10));
     }
 }

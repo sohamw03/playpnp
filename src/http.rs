@@ -120,16 +120,29 @@ pub async fn run_http_server(
             .unwrap();
     });
 
-    // Poll VLC's authoritative state and clock. This covers both controls
-    // issued by BubbleUPnP and controls clicked directly in VLC.
+    // Poll VLC's authoritative state and clock with adaptive intervals
+    // and offloaded to spawn_blocking to avoid blocking Tokio worker threads.
     let av_state_clone = av_state.clone();
     let player_clone = player.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut last_player_state = PlaybackState::Stopped;
         loop {
-            interval.tick().await;
-            let (pos, dur, player_state) = {
-                if let Ok(mut p) = player_clone.lock() {
+            // Adaptive polling interval:
+            // - Playing / Transitioning: 500ms for smooth timeline & buffer tracking
+            // - Paused: 1000ms
+            // - Stopped / Idle: 2500ms to save CPU & battery
+            let sleep_duration = match last_player_state {
+                PlaybackState::Playing | PlaybackState::Transitioning => {
+                    std::time::Duration::from_millis(500)
+                }
+                PlaybackState::Paused => std::time::Duration::from_millis(1000),
+                PlaybackState::Stopped => std::time::Duration::from_millis(2500),
+            };
+            tokio::time::sleep(sleep_duration).await;
+
+            let player_c = player_clone.clone();
+            let (pos, dur, player_state) = tokio::task::spawn_blocking(move || {
+                if let Ok(mut p) = player_c.lock() {
                     p.poll_sync();
                     let (pos, dur) = p.get_position();
                     (pos, dur, p.get_state())
@@ -140,7 +153,15 @@ pub async fn run_http_server(
                         PlaybackState::Stopped,
                     )
                 }
-            };
+            })
+            .await
+            .unwrap_or((
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                PlaybackState::Stopped,
+            ));
+
+            last_player_state = player_state;
 
             let state_changed = {
                 let mut state = av_state_clone.write().unwrap();
@@ -853,20 +874,16 @@ async fn handle_avtransport(
         }
         "GetPositionInfo" => {
             let av = state.av_state.read().unwrap().clone();
-            let (pos, dur) = {
-                if let Ok(p) = state.player.lock() {
-                    p.get_position()
-                } else {
-                    (av.position, av.duration)
-                }
-            };
-            // VLC may not know the length until its network input has
-            // opened, while DIDL metadata may already provide it.
-            let effective_duration = if dur > std::time::Duration::ZERO {
-                dur
+            // Read from AVState directly with smooth subsecond interpolation
+            // without acquiring player.lock(), completely eliminating lock contention with control actions.
+            let pos = if av.transport_state == TransportState::Playing {
+                let subsecond = av.last_updated.elapsed().min(std::time::Duration::from_millis(950));
+                av.position + subsecond
             } else {
-                av.duration
+                av.position
             };
+            let dur = av.duration;
+            let effective_duration = dur;
             let effective_position = if effective_duration > std::time::Duration::ZERO {
                 pos.min(effective_duration)
             } else {
@@ -1011,7 +1028,15 @@ async fn handle_avtransport(
         }
         "SetPlayMode" => Ok("".to_string()),
         "GetCurrentTransportActions" => {
-            Ok("<Actions>Play,Stop,Pause,Seek,Next,Previous</Actions>".to_string())
+            let av = state.av_state.read().unwrap();
+            let actions = match av.transport_state {
+                TransportState::Playing => "Play,Stop,Pause,Seek",
+                TransportState::PausedPlayback => "Play,Stop,Seek",
+                TransportState::Stopped => "Play",
+                TransportState::Transitioning => "Stop",
+                TransportState::NoMediaPresent => "",
+            };
+            Ok(format!("<Actions>{}</Actions>", actions))
         }
         other => {
             tracing::warn!("Unknown AVTransport action: {}", other);

@@ -2,7 +2,13 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+static ENDPOINT_CACHE: std::sync::LazyLock<Mutex<Option<(Instant, Vec<NetworkEndpoint>)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+static PEER_CACHE: std::sync::LazyLock<Mutex<Option<(Instant, Vec<Ipv4Addr>)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -202,8 +208,23 @@ pub fn local_ip() -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
 }
 
-/// Returns all candidate network endpoints (Wi-Fi, Hotspot, Tailscale, Ethernet)
+/// Returns all candidate network endpoints (Wi-Fi, Hotspot, Tailscale, Ethernet), cached with 15s TTL
 pub fn get_candidate_endpoints() -> Vec<NetworkEndpoint> {
+    if let Ok(guard) = ENDPOINT_CACHE.lock() {
+        if let Some((ts, ref endpoints)) = *guard {
+            if ts.elapsed() < Duration::from_secs(15) {
+                return endpoints.clone();
+            }
+        }
+    }
+    let fresh = compute_candidate_endpoints();
+    if let Ok(mut guard) = ENDPOINT_CACHE.lock() {
+        *guard = Some((Instant::now(), fresh.clone()));
+    }
+    fresh
+}
+
+fn compute_candidate_endpoints() -> Vec<NetworkEndpoint> {
     // Env override
     if let Ok(forced) = std::env::var("PLAYPNP_BIND_IP") {
         if let Ok(v4) = forced.parse::<Ipv4Addr>() {
@@ -364,8 +385,23 @@ pub fn pick_ip_for_target(target: IpAddr) -> Ipv4Addr {
     endpoints[0].ip
 }
 
-/// Query Tailscale CLI for active peers on the tailnet
+/// Query Tailscale CLI for active peers on the tailnet, cached with 15s TTL
 pub fn get_tailscale_peers() -> Vec<Ipv4Addr> {
+    if let Ok(guard) = PEER_CACHE.lock() {
+        if let Some((ts, ref peers)) = *guard {
+            if ts.elapsed() < Duration::from_secs(15) {
+                return peers.clone();
+            }
+        }
+    }
+    let fresh = compute_tailscale_peers();
+    if let Ok(mut guard) = PEER_CACHE.lock() {
+        *guard = Some((Instant::now(), fresh.clone()));
+    }
+    fresh
+}
+
+fn compute_tailscale_peers() -> Vec<Ipv4Addr> {
     let mut peers = HashSet::new();
 
     // 1. Check environment variable PLAYPNP_PEERS (comma-separated)
