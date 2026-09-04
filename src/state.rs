@@ -50,7 +50,7 @@ impl Default for AVState {
             title: String::new(),
             duration: Duration::from_secs(0),
             position: Duration::from_secs(0),
-            volume: 50,
+            volume: 100,
             mute: false,
             track: 0,
             last_change_seq: 0,

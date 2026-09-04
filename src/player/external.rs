@@ -34,7 +34,7 @@ impl VlcPlayer {
             last_pos_time: Instant::now(),
             pending_seek: None,
             state: PlaybackState::Stopped,
-            volume: 50,
+            volume: 100,
             mute: false,
         }
     }
@@ -372,7 +372,7 @@ impl MediaPlayer for VlcPlayer {
                 // `pause` is a toggle in VLC's RC interface. `play` resumes
                 // the current playlist item without inverting an already
                 // playing state.
-                self.send_cmd("play");
+                self.send_cmd("pause");
                 if self.rc_stream.is_none() {
                     self.disconnect();
                     anyhow::bail!("VLC remote-control connection was lost");

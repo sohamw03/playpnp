@@ -22,7 +22,7 @@ impl MockPlayer {
             title: String::new(),
             uri_duration: Duration::from_secs(0),
             state: PlaybackState::Stopped,
-            volume: 50,
+            volume: 100,
             mute: false,
             base_position: Duration::from_secs(0),
             play_start: None,
