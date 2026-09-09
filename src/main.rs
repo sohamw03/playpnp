@@ -1,6 +1,7 @@
 mod config;
 mod http;
 mod ipc;
+mod platform;
 mod player;
 mod ssdp;
 mod state;
@@ -200,6 +201,20 @@ fn start_background_daemon() -> anyhow::Result<()> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Detach into a new session so closing the terminal (SIGHUP)
+        // doesn't kill the daemon. `serve` + systemd is still the
+        // recommended Linux mode; this just makes bare `playpnp` sane.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
     let _child = cmd.spawn()?;
     let ready = rt.block_on(async {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -293,13 +308,28 @@ fn run_diag() {
         local_ip
     );
 
-    println!("\nFirewall: run 'Get-NetFirewallRule -DisplayName *playpnp* | Format-List'");
-    println!("Network profile: run 'Get-NetConnectionProfile | Format-List Name,NetworkCategory'");
+    #[cfg(windows)]
+    {
+        println!("\nPeers file: %APPDATA%\\playpnp\\peers.txt (one IP per line)");
+        println!("\nFirewall: run 'Get-NetFirewallRule -DisplayName *playpnp* | Format-List'");
+        println!(
+            "Network profile: run 'Get-NetConnectionProfile | Format-List Name,NetworkCategory'"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        println!(
+            "\nPeers file: {} (one IP per line)",
+            crate::platform::peers_hint()
+        );
+        println!("\nFirewall: allow UDP 1900 in + the ephemeral TCP port (ufw/nftables).");
+        println!("Check listening sockets with: ss -tulpn | grep playpnp");
+    }
 }
 
 fn print_help() {
     println!(
-        r#"playpnp - DLNA MediaRenderer for Windows
+        r#"playpnp - DLNA MediaRenderer
 
 Usage:
   playpnp          Start daemon in background with tray icon 📺 (silent)
@@ -311,7 +341,7 @@ Usage:
   playpnp version  Show version
 
 Features:
-  - 📺 System tray icon with status link and quit menu
+  - 📺 System tray icon with status link and quit menu (falls back to headless)
   - Real VLC media player control via RC interface
   - Multi-network support: Common Wi-Fi, Mobile Hotspot, and Tailscale
   - Dynamic UPnP device description matching client IP
@@ -363,12 +393,19 @@ fn run_with_tray(config: Config, local_ip: std::net::IpAddr) -> anyhow::Result<(
         local_ip,
     );
 
-    // After tray exits, ensure daemon stops
-    let _ = shutdown_tx.send(true);
-    let _ = daemon_handle.join();
-
-    if let Err(e) = tray_result {
-        tracing::error!("Tray error: {:?}", e);
+    match tray_result {
+        Ok(()) => {
+            // After tray exits, ensure daemon stops
+            let _ = shutdown_tx.send(true);
+            let _ = daemon_handle.join();
+        }
+        Err(e) => {
+            // No tray host (e.g. headless server, minimal Wayland bar):
+            // stay up headless instead of exiting. `serve` + systemd
+            // is the recommended Linux mode; this is the safety net.
+            tracing::warn!("Tray unavailable ({}), running headless", e);
+            let _ = daemon_handle.join();
+        }
     }
     Ok(())
 }

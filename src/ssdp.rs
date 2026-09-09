@@ -71,7 +71,7 @@ impl SsdpServer {
              LOCATION: {loc}\r\n\
              NT: {nt}\r\n\
              NTS: {nts}\r\n\
-             SERVER: Windows/10.0 UPnP/1.0 playpnp/1.0\r\n\
+             SERVER: {server}\r\n\
              USN: {usn}\r\n\
              BOOTID.UPNP.ORG: 1\r\n\
              CONFIGID.UPNP.ORG: 1\r\n\r\n",
@@ -81,6 +81,7 @@ impl SsdpServer {
             loc = self.location_for_ip(ip),
             nt = nt,
             nts = nts,
+            server = crate::platform::server_header(),
             usn = usn
         )
     }
@@ -186,13 +187,14 @@ impl SsdpServer {
              CACHE-CONTROL: max-age={max_age}\r\n\
              EXT:\r\n\
              LOCATION: {loc}\r\n\
-             SERVER: Windows/10.0 UPnP/1.0 playpnp/1.0\r\n\
+             SERVER: {server}\r\n\
              ST: {st}\r\n\
              USN: {usn}\r\n\
              BOOTID.UPNP.ORG: 1\r\n\
              CONFIGID.UPNP.ORG: 1\r\n\r\n",
             max_age = MAX_AGE,
             loc = loc,
+            server = crate::platform::server_header(),
             st = st_val,
             usn = usn
         ))

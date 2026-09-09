@@ -58,16 +58,11 @@ impl MockPlayer {
                     .spawn();
             });
         } else {
-            // Fallback: use Windows `start` to open with default handler (new Media Player)
-            // This creates own window as requested.
+            // Fallback: open with the system default handler.
             let uri = self.uri.clone();
             tracing::info!("Spawning system default player for {}", uri);
             std::thread::spawn(move || {
-                // `cmd /C start "" "uri"` is the idiomatic way to open via shell
-                let _ = std::process::Command::new("cmd")
-                    .args(["/C", "start", "", &uri])
-                    .spawn();
-                // Also try direct `explorer` fallback if cmd fails
+                crate::platform::open_url(&uri);
             });
         }
     }

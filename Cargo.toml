@@ -2,7 +2,7 @@
 name = "playpnp"
 version = "0.1.0"
 edition = "2024"
-description = "DLNA MediaRenderer for Windows - headless tray daemon controllable via BubbleUPnP"
+description = "DLNA MediaRenderer - headless tray daemon controllable via BubbleUPnP"
 authors = []
 license = "MIT"
 readme = "README.md"
@@ -34,8 +34,9 @@ http-body-util = "0.1"
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sysinfo = "0.33"
+libc = "0.2"
 
-# Tray daemon (Windows)
+# Tray daemon (Windows, Linux via StatusNotifier, macOS)
 tray-icon = { version = "0.24", optional = true }
 winit = { version = "0.30", optional = true }
 muda = { version = "0.19", optional = true }
@@ -45,9 +46,14 @@ muda = { version = "0.19", optional = true }
 # windows crate for advanced WMP/MF if needed
 windows = { version = "0.62", optional = true, features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
 
+# Linux tray menus (muda) call into GTK, which panics if not initialized
+# (and panic=abort would kill the daemon). Same gtk major as tray-icon uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+
 [features]
 default = ["tray"]
-tray = ["dep:tray-icon", "dep:winit", "dep:muda"]
+tray = ["dep:tray-icon", "dep:winit", "dep:muda", "dep:gtk"]
 native-mf = ["dep:windows"]
 with-vlc = []
 

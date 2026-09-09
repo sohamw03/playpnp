@@ -10,6 +10,13 @@ pub fn run_tray(
     use tray_icon::{TrayIconBuilder, TrayIconEvent, menu::MenuEvent};
     use winit::event_loop::{ControlFlow, EventLoop};
 
+    // muda/tray-icon menus call into GTK on Linux, which panics
+    // ("GTK has not been initialized") instead of returning Err —
+    // and panic=abort would take the whole daemon down. Init first;
+    // a failed init (e.g. no display) falls back to headless via Err.
+    #[cfg(target_os = "linux")]
+    gtk::init().map_err(|e| anyhow::anyhow!("GTK init failed: {}", e))?;
+
     let event_loop = EventLoop::new()?;
 
     let status_item = MenuItem::new(
@@ -55,6 +62,17 @@ pub fn run_tray(
             std::time::Instant::now() + std::time::Duration::from_millis(300),
         ));
 
+        // libayatana-appindicator registers its StatusNotifierItem over
+        // async GDBus calls, which only complete when the GLib default
+        // context is iterated. winit never runs one, so pump it here —
+        // otherwise the tray item never appears on StatusNotifier hosts
+        // (e.g. the Noctalia bar) even though the daemon is healthy.
+        #[cfg(target_os = "linux")]
+        {
+            let ctx = gtk::glib::MainContext::default();
+            while ctx.iteration(false) {}
+        }
+
         // Check if IPC stop or external shutdown fired
         if *shutdown_rx.borrow() {
             elwt.exit();
@@ -69,9 +87,7 @@ pub fn run_tray(
             if menu_event.id == show_id {
                 tracing::info!("Tray: Show Status clicked");
                 let url = format!("http://{}:{}/", local_ip, http_port);
-                let _ = std::process::Command::new("cmd")
-                    .args(["/C", "start", "", &url])
-                    .spawn();
+                crate::platform::open_url(&url);
             } else if menu_event.id == stop_id || menu_event.id == quit_id {
                 tracing::info!("Tray: Stop/Quit clicked");
                 let _ = shutdown_tx.send(true);

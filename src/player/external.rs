@@ -85,47 +85,45 @@ impl VlcPlayer {
         let port = self.rc_port;
         tracing::info!("Launching VLC with RC interface on 127.0.0.1:{}", port);
 
-        let child = match Command::new(&vlc_path)
-            .args([
-                "--extraintf",
-                "rc",
-                "--rc-host",
-                &format!("127.0.0.1:{}", port),
-                "--rc-quiet",
-                "--no-video-title-show",
-                "--fullscreen",
-                "--audio-language=en,eng,English",
-                // Hardware acceleration for video decoding on Windows (Direct3D11 / DXVA2)
-                "--avcodec-hw=any",
-                // Enhanced buffering and resilience for weak Wi-Fi / lossy connections
-                "--network-caching=5000",
-                "--file-caching=3000",
-                "--live-caching=3000",
-                "--http-reconnect",
-                "--clock-jitter=5000",
-            ])
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Failed to spawn VLC: {}", e);
-                return false;
-            }
-        };
-        self.child = Some(child);
+        // Linux VLC 3.x names the module `oldrc`; `rc` is an alias that
+        // usually works. Retry with `oldrc` once if the first attempt
+        // launches but never opens the RC port.
+        #[cfg(windows)]
+        let intfs: [&str; 1] = ["rc"];
+        #[cfg(not(windows))]
+        let intfs: [&str; 2] = ["rc", "oldrc"];
 
-        if self.connect_rc() {
-            tracing::info!("Connected to VLC RC interface");
-            let vlc_vol = (self.volume as u32 * 256) / 100;
-            let _ = self.send_cmd(&format!("volume {}", vlc_vol));
-            true
-        } else {
-            tracing::error!("Could not connect to VLC RC port {}", port);
+        for intf in intfs {
+            let child = match Command::new(&vlc_path)
+                .args(crate::platform::vlc_args(port, intf))
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to spawn VLC: {}", e);
+                    return false;
+                }
+            };
+            self.child = Some(child);
+
+            if self.connect_rc() {
+                tracing::info!("Connected to VLC RC interface (intf={})", intf);
+                let vlc_vol = (self.volume as u32 * 256) / 100;
+                let _ = self.send_cmd(&format!("volume {}", vlc_vol));
+                return true;
+            }
+            tracing::warn!(
+                "Could not connect to VLC RC port {} via intf={}, retrying...",
+                port,
+                intf
+            );
             if let Some(mut c) = self.child.take() {
                 let _ = c.kill();
             }
-            false
+            self.rc_stream = None;
         }
+        tracing::error!("Could not connect to VLC RC port {}", port);
+        false
     }
 
     fn connect_rc(&mut self) -> bool {

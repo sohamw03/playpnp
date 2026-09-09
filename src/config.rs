@@ -21,7 +21,7 @@ pub struct Config {
 impl Config {
     pub fn load() -> Self {
         let uuid = load_or_create_uuid();
-        let hostname = hostname::get().unwrap_or_else(|_| "playpnp".into());
+        let hostname = crate::platform::hostname();
         let friendly_name = format!("playpnp ({})", hostname);
         Self {
             uuid,
@@ -41,10 +41,7 @@ impl Config {
 }
 
 fn config_dir() -> PathBuf {
-    let base = dirs::config_dir()
-        .or_else(dirs::data_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("playpnp")
+    crate::platform::config_dir()
 }
 
 fn uuid_file_path() -> PathBuf {
@@ -64,32 +61,6 @@ fn load_or_create_uuid() -> Uuid {
     }
     let _ = std::fs::write(&path, new_uuid.to_string());
     new_uuid
-}
-
-mod hostname {
-    pub fn get() -> Result<String, ()> {
-        if let Ok(h) = std::env::var("COMPUTERNAME") {
-            if !h.is_empty() {
-                return Ok(h);
-            }
-        }
-        if let Ok(h) = std::env::var("HOSTNAME") {
-            if !h.is_empty() {
-                return Ok(h);
-            }
-        }
-        Ok("PC".to_string())
-    }
-}
-
-mod dirs {
-    use std::path::PathBuf;
-    pub fn config_dir() -> Option<PathBuf> {
-        std::env::var("APPDATA").ok().map(PathBuf::from)
-    }
-    pub fn data_dir() -> Option<PathBuf> {
-        std::env::var("APPDATA").ok().map(PathBuf::from)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,26 +107,9 @@ fn probe_route_ip(target: &str) -> Option<Ipv4Addr> {
     }
 }
 
-/// Detect default gateway from routing table
+/// Detect default gateway from routing table (see `platform` module).
 fn detect_default_gateway() -> Option<Ipv4Addr> {
-    // Run `route print 0.0.0.0` on Windows
-    let output = std::process::Command::new("route")
-        .args(["print", "0.0.0.0"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        // Look for: 0.0.0.0   0.0.0.0   <gateway>   <interface>   <metric>
-        if parts.len() >= 4 && parts[0] == "0.0.0.0" && parts[1] == "0.0.0.0" {
-            if let Ok(gw) = parts[2].parse::<Ipv4Addr>() {
-                if !gw.is_unspecified() && !gw.is_loopback() {
-                    return Some(gw);
-                }
-            }
-        }
-    }
-    None
+    crate::platform::default_gateway()
 }
 
 /// Check if an IP belongs to VirtualBox host-only network (192.168.56.x default)
@@ -264,15 +218,7 @@ fn compute_candidate_endpoints() -> Vec<NetworkEndpoint> {
                 }
 
                 let name = iface.name.to_lowercase();
-                if name.contains("wsl")
-                    || name.contains("hyper-v")
-                    || name.contains("hyperv")
-                    || name.contains("vmware")
-                    || name.contains("virtualbox")
-                    || name.contains("vbox")
-                    || name.contains("docker")
-                    || name.contains("veth")
-                {
+                if crate::platform::is_virtual_iface(&name) {
                     continue;
                 }
 

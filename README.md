@@ -1,109 +1,116 @@
-# playpnp — DLNA MediaRenderer for Windows
+# playpnp — cast videos from your phone to your PC
 
-Headless tray daemon that makes your Windows PC appear as a robust **DLNA MediaRenderer** (DMR) to **BubbleUPnP**, **mConnect**, **VLC**, and any UPnP/DLNA control point.
+`playpnp` turns your computer into a **DLNA MediaRenderer** (DMR) that shows up in **BubbleUPnP**, **mConnect**, and any UPnP/DLNA control point. Pick a video on your phone, hit cast — it plays on your PC in **real VLC**, with position tracking, seeking, volume, and pause/resume all in sync.
 
-Cast videos, music, and streams directly to your Windows PC with real playback in **VLC media player**, featuring synchronized position tracking, volume control, seeking, and pause/resume.
+Windows and Linux (Arch, Ubuntu). Single Rust binary — just add VLC. (On Linux the tray build uses system GTK/AppIndicator libs; the `--no-default-features` build is dependency-free.)
 
 ---
 
-## 🎯 Supported Connectivity Scenarios
+## Why playpnp?
 
-`playpnp` is architected to work seamlessly across all three core connectivity topologies:
+- **Real VLC playback, not a fake player.** Most lightweight renderers are audio-only (`gmrender-resurrect`, `upmpdcli`) or full media centers (Kodi, JRiver). playpnp drives the VLC you already have through its remote-control interface: video, audio, fullscreen.
+- **Bidirectional state sync.** VLC is treated as authoritative — scrubbing, pausing, or closing the VLC window itself is reflected back to the controller via standard `LastChange` events. Position polling adapts (500 ms while playing, 2.5 s when idle) and never races ahead on stalled Wi-Fi.
+- **Actually works on phone hotspots.** Android blocks SSDP multicast on hotspots. playpnp detects the gateway (your phone) and sends directed unicast + subnet broadcast so discovery is instant.
+- **One binary, tray or headless.** Runs as a tray app (Windows, StatusNotifier bar widgets on Wayland) and degrades gracefully to headless where there's no tray. `serve` + the included systemd unit covers servers.
+- **Helpful extras:** browser dashboard with remote controls, English/SDH subtitle and English audio auto-selection, dynamic `URLBase` so control URLs are always reachable on multi-homed machines, `playpnp diag` for network troubleshooting.
 
-| Scenario | Network Setup | Discovery & Routing Mechanism |
+---
+
+## 🎯 Connectivity
+
+| Scenario | Status | How |
 | :--- | :--- | :--- |
-| **1. Mobile Hotspot** | Phone emits mobile hotspot; PC connects to hotspot Wi-Fi | Android kernel blocks L2 multicast (`239.255.255.250`). `playpnp` detects the default gateway (the phone's IP, e.g. `192.168.43.1`) and sends **directed unicast NOTIFY** to `gateway:1900` + **subnet broadcast** (`192.168.43.255:1900`). BubbleUPnP discovers the PC instantly. |
-| **2. Tailscale VPN** | Phone & PC on separate internet connections, connected via Tailscale | Tailscale does not route multicast. `playpnp` discovers Tailscale peers via `tailscale status --json`, `PLAYPNP_PEERS=100.x.y.z`, or `%APPDATA%\playpnp\peers.txt`, and sends **unicast NOTIFY** directly to `peer_ip:1900`. `pick_ip_for_target()` ensures `LOCATION` URLs advertise the `100.x` Tailscale IP. |
-| **3. Common Wi-Fi** | Phone & PC on the same Wi-Fi network / LAN | Outgoing UDP sockets bind with `IP_MULTICAST_IF` physically on the Wi-Fi adapter. Sends standard multicast `239.255.255.250:1900` + directed subnet broadcast. VirtualBox (`192.168.56.x`), WSL, and link-local interfaces are automatically filtered out. |
+| **Common Wi-Fi** (phone + PC on one LAN) | ✅ Works | Multicast `239.255.255.250:1900` + subnet broadcast per interface. VirtualBox, WSL, Docker, link-local and virtual NICs filtered out automatically |
+| **Mobile hotspot** (PC on phone's hotspot) | ✅ Works | Android blocks multicast, so playpnp unicasts NOTIFY to the gateway (the phone, e.g. `192.168.43.1:1900`) + subnet broadcast |
+| **Tailscale / VPN** | ⚠️ Known limitation, see below | Unicast NOTIFY to peers is implemented (`tailscale status`, `PLAYPNP_PEERS`, `peers.txt`), but discovery over Tailscale does not complete in practice |
+
+> ⚠️ **Tailscale doesn't work.** The unicast machinery is there and `diag` shows your peers, but phones behind Tailscale never discover the renderer — cause unknown, looks non-fixable from our side. Common Wi-Fi and mobile hotspot are the supported paths. If you crack it, PRs welcome.
 
 ---
 
 ## ✨ Features
 
-- **Real VLC Player Backend (`VlcPlayer`):**
-  - Manages VLC via its remote control TCP socket interface (`--extraintf rc --rc-host 127.0.0.1:52422`).
-  - Supports real **Play**, **Pause**, **Stop**, **Seek** (`seek <seconds>`), **Volume** (`volume <0-512>`), and Track Duration polling.
-  - VLC is the supported playback backend and is required. Screenbox/Windows Media Player are not used because they do not expose a compatible control/state API here.
-  - No duplicate windows: reuses the VLC instance started by playpnp when switching tracks.
-- **Dynamic `<URLBase>` UPnP Generation:**
-  - `GET /description.xml` dynamically inspects the HTTP `Host` header (e.g. `192.168.1.102:port`, `192.168.43.x:port`, or `100.x.y.z:port`) and returns `<URLBase>http://{host}/</URLBase>`.
-  - Guarantees control and event subscription URLs are reachable regardless of which interface the phone used.
-- **Web Dashboard & Remote Controls:**
-  - Open `http://<pc-ip>:<port>/` in any browser (desktop or mobile).
-  - Inspect current playback status (track title, artist, elapsed/total duration, volume).
-  - Control playback remotely with Play, Pause, and Stop buttons.
-  - View all active network endpoints and manually add peers for unicast notification.
-- **System Tray & Local IPC:**
-  - Runs unobtrusively in the Windows system tray.
-  - Local control CLI via `playpnp status` and `playpnp stop` on `127.0.0.1:52411`.
+- **Real VLC backend** — Play, Pause, Stop, Seek, Volume/Mute over VLC's RC interface (`127.0.0.1:52422`). Reuses one VLC instance across tracks, auto-closes it when idle. VLC is required.
+- **Synced timeline** — duration from DIDL metadata or VLC probing, sub-second interpolation capped so weak Wi-Fi never makes the timeline jump.
+- **Auto tracks** — prefers SDH English subtitles, then English; same for audio. Leaves your settings alone when there's no match.
+- **Dynamic `URLBase`** — `description.xml` answers from the request's `Host`, so multi-NIC machines always hand out reachable control/event URLs.
+- **Dashboard** — `http://<pc-ip>:<port>/` shows track, position, volume, endpoints, peers, and Play/Pause/Stop buttons.
+- **Tray + CLI** — tray menu (Show Status / Stop / Quit), plus `playpnp status` and `playpnp stop` over a local control port.
 
 ---
 
 ## 🚀 Quick Start
 
-### Build
+Prerequisites: install **VLC** (`https://www.videolan.org` on Windows, `vlc` package on Linux).
+
+### Windows
 
 ```powershell
 cargo build --release
-```
 
-### Run Daemon
-
-```powershell
-# Run with tray icon (normal mode)
+# Background with tray icon
 .\target\release\playpnp.exe
 
-# Or run headless in terminal (no tray icon)
+# Or headless in the terminal
 .\target\release\playpnp.exe serve
+
+.\target\release\playpnp.exe diag    # network + VLC diagnostics
+.\target\release\playpnp.exe status  # is it running?
+.\target\release\playpnp.exe stop    # clean shutdown
 ```
 
-### Inspect Diagnostics
+### Linux (Arch / Ubuntu)
 
-```powershell
-.\target\release\playpnp.exe diag
+```bash
+# Arch (paru works too; xdotool provides libxdo.so for the tray link)
+sudo pacman -S vlc gtk3 libayatana-appindicator xdotool
+
+# Ubuntu
+sudo apt install vlc libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+
+cargo build --release
+
+# Foreground (recommended, works with systemd)
+./target/release/playpnp serve
+
+# Background with tray (falls back to headless if no tray host)
+./target/release/playpnp
+
+# Headless build for servers (no tray/GTK at all)
+cargo build --release --no-default-features
 ```
 
-Outputs primary routing IP, candidate endpoints, broadcast addresses, gateways, detected Tailscale peers, and VLC installation status.
+### systemd user service (Linux)
 
-### Manage Running Daemon
-
-```powershell
-# Check status
-.\target\release\playpnp.exe status
-
-# Clean shutdown
-.\target\release\playpnp.exe stop
+```bash
+mkdir -p ~/.config/systemd/user
+cp contrib/playpnp.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now playpnp
 ```
 
 ---
 
-## ⚙️ Environment Variables & Customization
+## ⚙️ Configuration
 
 | Variable | Description |
 | :--- | :--- |
-| `PLAYPNP_BIND_IP` | Force a specific local IPv4 address (e.g. `192.168.43.100`). |
-| `PLAYPNP_PEERS` | Comma-separated list of Tailscale or remote peer IPs to notify via unicast (e.g. `100.82.14.5,192.168.43.1`). |
-| `PLAYPNP_NO_TRAY` | Set to `1` to run in headless console mode without a system tray icon. |
-| `RUST_LOG` | Set logging level (`debug`, `info`, `warn`). |
+| `PLAYPNP_BIND_IP` | Pin a local IPv4 address (e.g. `192.168.43.100`) |
+| `PLAYPNP_PEERS` | Extra IPs to unicast NOTIFY to, comma-separated (e.g. `192.168.43.1`) |
+| `RUST_LOG` | Log level (`debug`, `info`, `warn`) |
 
-Peers can also be added permanently by creating `%APPDATA%\playpnp\peers.txt` (one IP per line).
+Extra peers can also live in `peers.txt` — `%APPDATA%\playpnp\peers.txt` on Windows, `~/.config/playpnp/peers.txt` on Linux (one IP per line). The dashboard can add peers at runtime too. Device identity (`uuid`) persists next to it.
 
 ---
 
-## 🛡️ Windows Firewall Notice
+## 🛡️ Firewall
 
-Windows Firewall must allow incoming UDP (port 1900) and TCP (ephemeral port) on `playpnp.exe`.
-
-To verify or add firewall rules:
-```powershell
-# Allow playpnp inbound TCP & UDP
-New-NetFirewallRule -DisplayName "playpnp release" -Direction Inbound -Program "$PWD\target\release\playpnp.exe" -Action Allow
-```
-
-When connected to a phone mobile hotspot, ensure Windows classifies the network as **Private**:
-```powershell
-Set-NetConnectionProfile -InterfaceAlias "Wi-Fi" -NetworkCategory Private
-```
+- **Windows:** allow inbound UDP 1900 + the ephemeral TCP port for `playpnp.exe`:
+  ```powershell
+  New-NetFirewallRule -DisplayName "playpnp release" -Direction Inbound -Program "$PWD\target\release\playpnp.exe" -Action Allow
+  ```
+  On a phone hotspot, set the network to **Private**: `Set-NetConnectionProfile -InterfaceAlias "Wi-Fi" -NetworkCategory Private`
+- **Linux:** desktop installs need nothing — it works out of the box. Only if you run `ufw`/`nftables` yourself, open UDP 1900 in and the ephemeral TCP port.
 
 ---
 

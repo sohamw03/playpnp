@@ -1,0 +1,13 @@
+[Unit]
+Description=playpnp DLNA MediaRenderer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Recommended Linux mode: foreground `serve` under systemd.
+ExecStart=%h/.cargo/bin/playpnp serve
+Restart=on-failure
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

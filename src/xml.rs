@@ -17,7 +17,7 @@ pub fn device_description(config: &Config, base_url: &str) -> String {
     <friendlyName>{friendly}</friendlyName>
     <manufacturer>playpnp</manufacturer>
     <manufacturerURL>https://github.com/playpnp/playpnp</manufacturerURL>
-    <modelDescription>DLNA MediaRenderer for Windows</modelDescription>
+    <modelDescription>DLNA MediaRenderer (playpnp)</modelDescription>
     <modelName>playpnp</modelName>
     <modelNumber>1</modelNumber>
     <modelURL>https://github.com/playpnp/playpnp</modelURL>

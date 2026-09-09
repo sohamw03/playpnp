@@ -33,22 +33,17 @@ pub fn create_player() -> Arc<Mutex<Box<dyn MediaPlayer>>> {
     Arc::new(Mutex::new(Box::new(external::VlcPlayer::new())))
 }
 
-// Helper to detect VLC installation
+// Helper to detect VLC installation (cross-platform: $PATH + known locations).
 pub fn find_vlc() -> Option<std::path::PathBuf> {
-    // Check PATH
-    if let Ok(path) = which::which("vlc") {
-        return Some(path);
+    // Check PATH for both `vlc` and `cvlc` (headless alias on Linux).
+    for name in ["vlc", "cvlc"] {
+        if let Ok(path) = which::which(name) {
+            return Some(path);
+        }
     }
-    // Common Windows install paths
-    let candidates = [
-        r"C:\Program Files\VideoLAN\VLC\vlc.exe",
-        r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
-        r"C:\vlc\vlc.exe",
-    ];
-    for c in candidates {
-        let p = std::path::PathBuf::from(c);
-        if p.exists() {
-            return Some(p);
+    for c in crate::platform::vlc_candidates() {
+        if c.exists() {
+            return Some(c);
         }
     }
     None
@@ -92,14 +87,7 @@ mod tests {
         };
         let port = 52425;
         let mut child = Command::new(&vlc_path)
-            .args([
-                "--extraintf",
-                "rc",
-                "--rc-host",
-                &format!("127.0.0.1:{}", port),
-                "--rc-quiet",
-                "--no-video-title-show",
-            ])
+            .args(crate::platform::vlc_args(port, "rc"))
             .spawn()
             .expect("spawn VLC");
 
