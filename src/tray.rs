@@ -42,11 +42,25 @@ pub fn run_tray(
     // Load 📺 icon
     let icon = load_icon();
 
+    // Hover-only text: tooltip covers Windows/macOS, Linux StatusNotifier
+    // ignores tooltip so Title is set directly below (with_title would
+    // leave a persistent label next to the icon).
+    const TRAY_HOVER_TEXT: &str = "PlayPnP - DLNA MediaRenderer";
+
     let _tray = TrayIconBuilder::new()
+        .with_id("playpnp")
         .with_menu(Box::new(menu))
-        .with_tooltip(format!("playpnp - {}", friendly_name))
+        .with_tooltip(TRAY_HOVER_TEXT)
         .with_icon(icon)
         .build()?;
+
+    // tray-icon leaves Title unset, so hosts fall back to its
+    // "tray-icon tray app {id}" AppIndicator id on hover.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        (*(_tray.app_indicator() as *mut libappindicator::AppIndicator))
+            .set_title(TRAY_HOVER_TEXT)
+    }
 
     // Channels
     let menu_channel = MenuEvent::receiver();

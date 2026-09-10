@@ -47,14 +47,15 @@ muda = { version = "0.19", optional = true }
 # windows crate for advanced WMP/MF if needed
 windows = { version = "0.62", optional = true, features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
 
-# Linux tray menus (muda) call into GTK, which panics if not initialized
-# (and panic=abort would kill the daemon). Same gtk major as tray-icon uses.
+# Linux tray: GTK for menus, libappindicator for StatusNotifier Title (hover).
+# Same gtk major as tray-icon uses.
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
+libappindicator = { version = "0.9", optional = true }
 
 [features]
 default = ["tray"]
-tray = ["dep:tray-icon", "dep:winit", "dep:muda", "dep:gtk"]
+tray = ["dep:tray-icon", "dep:winit", "dep:muda", "dep:gtk", "dep:libappindicator"]
 native-mf = ["dep:windows"]
 with-vlc = []
 
