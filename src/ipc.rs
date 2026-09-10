@@ -69,12 +69,28 @@ pub async fn send_status() -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&buf[..n]).to_string())
 }
 
-pub async fn run_control_server(
+/// Bind first, before HTTP/SSDP start. A racing second daemon gets
+/// `AddrInUse` here and must exit without serving anything.
+pub async fn bind_control_server() -> std::io::Result<TcpListener> {
+    let listener = TcpListener::bind(CONTROL_ADDR).await?;
+    tracing::info!("Control server listening on {}", CONTROL_ADDR);
+    Ok(listener)
+}
+
+/// True when an `anyhow` error chain contains `AddrInUse` (lost TCP race).
+pub fn is_addr_in_use(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
+pub async fn serve_control_server(
+    listener: TcpListener,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     friendly_name: String,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(CONTROL_ADDR).await?;
-    tracing::info!("Control server listening on {}", CONTROL_ADDR);
     loop {
         let (mut socket, addr) = listener.accept().await?;
         let shutdown_tx_clone = shutdown_tx.clone();

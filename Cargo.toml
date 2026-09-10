@@ -35,6 +35,7 @@ bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sysinfo = "0.33"
 libc = "0.2"
+fs2 = "0.4"
 
 # Tray daemon (Windows, Linux via StatusNotifier, macOS)
 tray-icon = { version = "0.24", optional = true }

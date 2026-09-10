@@ -3,6 +3,7 @@ mod http;
 mod ipc;
 mod platform;
 mod player;
+mod single_instance;
 mod ssdp;
 mod state;
 mod tray;
@@ -12,6 +13,24 @@ use config::Config;
 use state::new_shared_state;
 use std::sync::Arc;
 use tokio::sync::watch;
+
+fn exit_already_running() -> ! {
+    eprintln!("PlayPnP Already Running");
+    std::process::exit(1);
+}
+
+fn is_singleton_conflict(e: &anyhow::Error) -> bool {
+    ipc::is_addr_in_use(e) || e.to_string().contains("already running")
+}
+
+/// Join the daemon thread, mapping a lost single-instance race to silent success.
+fn join_daemon(handle: std::thread::JoinHandle<anyhow::Result<()>>) -> anyhow::Result<()> {
+    match handle.join() {
+        Ok(Ok(())) | Err(_) => Ok(()),
+        Ok(Err(e)) if is_singleton_conflict(&e) => Ok(()),
+        Ok(Err(e)) => Err(e),
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -25,10 +44,7 @@ fn main() -> anyhow::Result<()> {
                 .build()?;
             let already = rt.block_on(ipc::is_already_running());
             if already {
-                eprintln!(
-                    "playpnp is already running (control port 52411). Use `playpnp stop` to stop it."
-                );
-                std::process::exit(1);
+                exit_already_running();
             }
 
             // Foreground: initialize terminal logs
@@ -39,6 +55,15 @@ fn main() -> anyhow::Result<()> {
                 )
                 .with_target(false)
                 .init();
+
+            // File lock first: closes the check-then-bind race where two
+            // processes both see "not running" before either binds :52411.
+            // Held for the whole daemon lifetime (same path on Windows +
+            // Linux, different root via platform::config_dir).
+            let _instance_guard = match single_instance::SingleInstanceGuard::acquire()? {
+                Some(g) => g,
+                None => exit_already_running(),
+            };
 
             let config = Config::load();
             let local_ip = config::local_ip();
@@ -78,8 +103,12 @@ fn main() -> anyhow::Result<()> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run_daemon(config, local_ip))?;
-            println!("playpnp stopped");
+            match rt.block_on(run_daemon(config, local_ip)) {
+                Ok(()) => {}
+                Err(e) if is_singleton_conflict(&e) => exit_already_running(),
+                Err(e) => return Err(e),
+            }
+            println!("PlayPnP Stopped");
             return Ok(());
         }
         "__daemon" => {
@@ -91,6 +120,15 @@ fn main() -> anyhow::Result<()> {
             if already {
                 return Ok(());
             }
+
+            // Atomic guard: a second `playpnp` racing us fails here even
+            // though the control-port probe above said "not running".
+            // Silent exit — the winner owns the daemon; `start`'s readiness
+            // poll treats either outcome as success.
+            let _instance_guard = match single_instance::SingleInstanceGuard::acquire()? {
+                Some(g) => g,
+                None => return Ok(()),
+            };
 
             if std::env::var("RUST_LOG").is_ok() {
                 let _ = tracing_subscriber::fmt()
@@ -104,14 +142,22 @@ fn main() -> anyhow::Result<()> {
 
             #[cfg(feature = "tray")]
             {
-                run_with_tray(config, local_ip)?;
+                match run_with_tray(config, local_ip) {
+                    Ok(()) => {}
+                    Err(e) if is_singleton_conflict(&e) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
             }
             #[cfg(not(feature = "tray"))]
             {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?;
-                rt.block_on(run_daemon(config, local_ip))?;
+                match rt.block_on(run_daemon(config, local_ip)) {
+                    Ok(()) => {}
+                    Err(e) if is_singleton_conflict(&e) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
             }
             return Ok(());
         }
@@ -122,13 +168,13 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(async {
                 match ipc::send_stop().await {
                     Ok(_) => {
-                        println!("playpnp stopped");
+                        println!("PlayPnP Stopped");
                     }
                     Err(e) => {
                         if ipc::is_already_running().await {
                             eprintln!("failed to stop playpnp: {}", e);
                         } else {
-                            println!("playpnp not running");
+                            println!("PlayPnP Not Running");
                         }
                     }
                 }
@@ -163,7 +209,11 @@ fn main() -> anyhow::Result<()> {
         }
         "" | "start" => {
             // Default: start background daemon silently with 📺 tray icon.
-            start_background_daemon()?;
+            if start_background_daemon()? {
+                println!("PlayPnP Started");
+            } else {
+                println!("PlayPnP Already Running");
+            }
             return Ok(());
         }
         other => {
@@ -174,7 +224,9 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn start_background_daemon() -> anyhow::Result<()> {
+/// Returns true when a daemon is (now) running because of this call,
+/// false when one was already running.
+fn start_background_daemon() -> anyhow::Result<bool> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -182,7 +234,7 @@ fn start_background_daemon() -> anyhow::Result<()> {
     // Make repeated `playpnp` invocations harmless. The readiness wait below
     // also prevents an immediate `playpnp status` from losing a startup race.
     if rt.block_on(ipc::is_already_running()) {
-        return Ok(());
+        return Ok(false);
     }
 
     let exe = std::env::current_exe()?;
@@ -230,7 +282,7 @@ fn start_background_daemon() -> anyhow::Result<()> {
     });
 
     if ready {
-        Ok(())
+        Ok(true)
     } else {
         anyhow::bail!("playpnp daemon did not become ready within 5 seconds")
     }
@@ -360,29 +412,26 @@ fn run_with_tray(config: Config, local_ip: std::net::IpAddr) -> anyhow::Result<(
     let shutdown_tx_daemon = shutdown_tx.clone();
     let shutdown_rx_daemon = shutdown_rx.clone();
 
-    let daemon_handle = std::thread::spawn(move || {
+    let daemon_handle = std::thread::spawn(move || -> anyhow::Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
-        rt.block_on(async move {
-            if let Err(e) = run_daemon_with_channels(
-                config,
-                local_ip,
-                port_tx,
-                shutdown_tx_daemon,
-                shutdown_rx_daemon,
-            )
-            .await
-            {
-                tracing::error!("Daemon error: {:?}", e);
-            }
-        });
+        rt.block_on(run_daemon_with_channels(
+            config,
+            local_ip,
+            port_tx,
+            shutdown_tx_daemon,
+            shutdown_rx_daemon,
+        ))
     });
 
     let http_port = match port_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(p) => p,
-        Err(_) => 0,
+        Ok(p) if p != 0 => p,
+        // No HTTP announcement: daemon lost the singleton race before
+        // serving. No second tray — exit silently.
+        _ if daemon_handle.is_finished() => return join_daemon(daemon_handle),
+        _ => 0,
     };
 
     let tray_result = tray::run_tray(
@@ -397,17 +446,16 @@ fn run_with_tray(config: Config, local_ip: std::net::IpAddr) -> anyhow::Result<(
         Ok(()) => {
             // After tray exits, ensure daemon stops
             let _ = shutdown_tx.send(true);
-            let _ = daemon_handle.join();
+            join_daemon(daemon_handle)
         }
         Err(e) => {
             // No tray host (e.g. headless server, minimal Wayland bar):
             // stay up headless instead of exiting. `serve` + systemd
             // is the recommended Linux mode; this is the safety net.
             tracing::warn!("Tray unavailable ({}), running headless", e);
-            let _ = daemon_handle.join();
+            join_daemon(daemon_handle)
         }
     }
-    Ok(())
 }
 
 #[cfg(not(feature = "tray"))]
@@ -428,17 +476,33 @@ async fn run_daemon_with_channels(
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    // Singleton bind FIRST, before ephemeral HTTP (never conflicts) and
+    // reuse-port SSDP (would silently duplicate). Loser exits here.
+    let control_listener = ipc::bind_control_server().await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::Error::new(e).context(format!(
+                "playpnp is already running (control port {} busy)",
+                ipc::CONTROL_ADDR
+            ))
+        } else {
+            anyhow::Error::new(e).context("failed to bind control port")
+        }
+    })?;
+
     let av_state = new_shared_state();
     let player = player::create_player();
 
     let shutdown_rx_http = shutdown_rx.clone();
     let shutdown_rx_ssdp = shutdown_rx.clone();
 
-    // Control server
+    // Control server (listener already bound above — no second bind, no
+    // swallowed AddrInUse).
     let friendly_clone = config.friendly_name.clone();
     let shutdown_tx_clone = shutdown_tx.clone();
-    tokio::spawn(async move {
-        if let Err(e) = ipc::run_control_server(shutdown_tx_clone, friendly_clone).await {
+    let control_handle = tokio::spawn(async move {
+        if let Err(e) =
+            ipc::serve_control_server(control_listener, shutdown_tx_clone, friendly_clone).await
+        {
             tracing::error!("Control server error: {}", e);
         }
     });
@@ -499,5 +563,6 @@ async fn run_daemon_with_channels(
     let _ = http_shutdown_tx.send(true);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     ssdp_handle.abort();
+    control_handle.abort();
     Ok(())
 }
