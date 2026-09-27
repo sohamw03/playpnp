@@ -23,6 +23,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 socket2 = "0.6"
 quick-xml = { version = "0.42", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 local-ip-address = "0.6"
 if-addrs = "0.13"

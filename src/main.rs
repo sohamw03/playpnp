@@ -33,8 +33,37 @@ fn join_daemon(handle: std::thread::JoinHandle<anyhow::Result<()>>) -> anyhow::R
 }
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    // Global player flag, accepted before or after the subcommand:
+    //   playpnp -p vlc serve | playpnp serve --player=mpv
+    // Precedence: CLI flag, otherwise auto (mpv first, VLC fallback).
+    let mut player_backend = "auto".to_string();
+    let mut args: Vec<String> = Vec::new();
+    let mut raw = std::env::args().skip(1).peekable();
+    while let Some(a) = raw.next() {
+        if a == "-p" || a == "--player" {
+            match raw.next() {
+                Some(v) => player_backend = v,
+                None => {
+                    eprintln!("--player needs a value: mpv, vlc, or auto");
+                    std::process::exit(1);
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--player=") {
+            player_backend = v.to_string();
+        } else if let Some(v) = a.strip_prefix("-p=") {
+            player_backend = v.to_string();
+        } else {
+            args.push(a);
+        }
+    }
+    if !["auto", "mpv", "vlc"].contains(&player_backend.to_ascii_lowercase().as_str()) {
+        eprintln!(
+            "Unknown player '{}': use mpv, vlc, or auto",
+            player_backend
+        );
+        std::process::exit(1);
+    }
+    let cmd = args.first().map(|s| s.as_str()).unwrap_or("");
 
     match cmd {
         "serve" => {
@@ -97,13 +126,21 @@ fn main() -> anyhow::Result<()> {
                 "  HTTP: 0.0.0.0:0 (ephemeral), description.xml uses dynamic URLBase from Host header"
             );
             println!("  Control: 127.0.0.1:52411 for playpnp stop/status");
+            println!(
+                "  Player: {} (change with -p mpv|vlc|auto)",
+                if player_backend == "auto" {
+                    player::player_backend_name().to_string()
+                } else {
+                    player_backend.clone()
+                }
+            );
             println!("  Dashboard: http://{}:<port>/ after startup", local_ip);
             println!("  Press Ctrl+C or run 'playpnp stop' to stop.");
 
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            match rt.block_on(run_daemon(config, local_ip)) {
+            match rt.block_on(run_daemon(config, local_ip, player_backend.clone())) {
                 Ok(()) => {}
                 Err(e) if is_singleton_conflict(&e) => exit_already_running(),
                 Err(e) => return Err(e),
@@ -142,7 +179,7 @@ fn main() -> anyhow::Result<()> {
 
             #[cfg(feature = "tray")]
             {
-                match run_with_tray(config, local_ip) {
+                match run_with_tray(config, local_ip, player_backend.clone()) {
                     Ok(()) => {}
                     Err(e) if is_singleton_conflict(&e) => return Ok(()),
                     Err(e) => return Err(e),
@@ -153,7 +190,7 @@ fn main() -> anyhow::Result<()> {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?;
-                match rt.block_on(run_daemon(config, local_ip)) {
+                match rt.block_on(run_daemon(config, local_ip, player_backend.clone())) {
                     Ok(()) => {}
                     Err(e) if is_singleton_conflict(&e) => return Ok(()),
                     Err(e) => return Err(e),
@@ -209,7 +246,7 @@ fn main() -> anyhow::Result<()> {
         }
         "" | "start" => {
             // Default: start background daemon silently with 📺 tray icon.
-            if start_background_daemon()? {
+            if start_background_daemon(&player_backend)? {
                 println!("PlayPnP Started");
             } else {
                 println!("PlayPnP Already Running");
@@ -226,7 +263,7 @@ fn main() -> anyhow::Result<()> {
 
 /// Returns true when a daemon is (now) running because of this call,
 /// false when one was already running.
-fn start_background_daemon() -> anyhow::Result<bool> {
+fn start_background_daemon(player_backend: &str) -> anyhow::Result<bool> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -240,6 +277,8 @@ fn start_background_daemon() -> anyhow::Result<bool> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__daemon")
+        .arg("-p")
+        .arg(player_backend)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -342,11 +381,18 @@ fn run_diag() {
         }
     }
 
-    // VLC check
+    // Player check (mpv first, VLC fallback)
+    match player::find_mpv() {
+        Some(p) => println!("\nmpv: Found at {}", p.display()),
+        None => println!("\nmpv: NOT FOUND — will fall back to VLC if present"),
+    }
     if let Some(vlc_path) = player::find_vlc() {
-        println!("\nVLC: Found at {}", vlc_path.display());
+        println!("VLC: Found at {}", vlc_path.display());
     } else {
-        println!("\nVLC: NOT FOUND — playback is unavailable until VLC is installed");
+        println!("VLC: NOT FOUND");
+    }
+    if player::find_mpv().is_none() && player::find_vlc().is_none() {
+        println!("WARNING: neither mpv nor VLC found — playback unavailable until one is installed");
     }
 
     println!("\nSDP Strategy:");
@@ -384,17 +430,19 @@ fn print_help() {
         r#"playpnp - DLNA MediaRenderer
 
 Usage:
-  playpnp          Start daemon in background with tray icon 📺 (silent)
-  playpnp serve    Run in foreground without icon, all logs in terminal
+  playpnp [-p mpv|vlc|auto]          Start daemon in background with tray icon 📺 (silent)
+  playpnp [-p mpv|vlc|auto] serve    Run in foreground without icon, all logs in terminal
   playpnp stop     Stop running daemon
   playpnp status   Show daemon status
   playpnp diag     Show network diagnostics (IPs, firewall help)
   playpnp help     Show this help
   playpnp version  Show version
 
+  -p, --player <mpv|vlc|auto>  Player backend (default: auto = mpv first, VLC fallback)
+
 Features:
   - 📺 System tray icon with status link and quit menu (falls back to headless)
-  - Real VLC media player control via RC interface
+  - Real mpv player control via JSON IPC (VLC fallback via RC interface)
   - Multi-network support: Common Wi-Fi, Mobile Hotspot, and Tailscale
   - Dynamic UPnP device description matching client IP
 "#
@@ -402,7 +450,11 @@ Features:
 }
 
 #[cfg(feature = "tray")]
-fn run_with_tray(config: Config, local_ip: std::net::IpAddr) -> anyhow::Result<()> {
+fn run_with_tray(
+    config: Config,
+    local_ip: std::net::IpAddr,
+    player_backend: String,
+) -> anyhow::Result<()> {
     use std::sync::mpsc;
 
     let friendly = config.friendly_name.clone();
@@ -420,6 +472,7 @@ fn run_with_tray(config: Config, local_ip: std::net::IpAddr) -> anyhow::Result<(
         rt.block_on(run_daemon_with_channels(
             config,
             local_ip,
+            player_backend,
             port_tx,
             shutdown_tx_daemon,
             shutdown_rx_daemon,
@@ -459,19 +512,36 @@ fn run_with_tray(config: Config, local_ip: std::net::IpAddr) -> anyhow::Result<(
 }
 
 #[cfg(not(feature = "tray"))]
-fn run_with_tray(_config: Config, _local_ip: std::net::IpAddr) -> anyhow::Result<()> {
+fn run_with_tray(
+    _config: Config,
+    _local_ip: std::net::IpAddr,
+    _player_backend: String,
+) -> anyhow::Result<()> {
     anyhow::bail!("tray feature disabled")
 }
 
-async fn run_daemon(config: Config, local_ip: std::net::IpAddr) -> anyhow::Result<()> {
+async fn run_daemon(
+    config: Config,
+    local_ip: std::net::IpAddr,
+    player_backend: String,
+) -> anyhow::Result<()> {
     let (port_tx, _port_rx) = std::sync::mpsc::channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    run_daemon_with_channels(config, local_ip, port_tx, shutdown_tx, shutdown_rx).await
+    run_daemon_with_channels(
+        config,
+        local_ip,
+        player_backend,
+        port_tx,
+        shutdown_tx,
+        shutdown_rx,
+    )
+    .await
 }
 
 async fn run_daemon_with_channels(
     config: Config,
     local_ip: std::net::IpAddr,
+    player_backend: String,
     port_notify: std::sync::mpsc::Sender<u16>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
@@ -490,7 +560,7 @@ async fn run_daemon_with_channels(
     })?;
 
     let av_state = new_shared_state();
-    let player = player::create_player();
+    let player = player::create_player_forced(&player_backend);
 
     let shutdown_rx_http = shutdown_rx.clone();
     let shutdown_rx_ssdp = shutdown_rx.clone();

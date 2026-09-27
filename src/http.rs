@@ -34,6 +34,34 @@ pub struct Subscription {
     pub nt: String,
     pub timeout_secs: u64,
     pub seq: u32,
+    // Consecutive NOTIFY delivery failures. The phone's listener can die
+    // across a hotspot drop (new port on return); without pruning, NOTIFYs
+    // are blackholed forever and the controller looks frozen.
+    pub failures: u32,
+}
+
+fn note_notify_result(subs: &Arc<RwLock<HashMap<String, Subscription>>>, sid: &str, ok: bool) {
+    if let Ok(mut guard) = subs.write() {
+        if let Some(sub) = guard.get_mut(sid) {
+            if ok {
+                sub.failures = 0;
+            } else {
+                sub.failures = sub.failures.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn purge_dead_subscriptions(subs: &Arc<RwLock<HashMap<String, Subscription>>>) {
+    if let Ok(mut guard) = subs.write() {
+        guard.retain(|sid, sub| {
+            let keep = sub.failures < 10;
+            if !keep {
+                tracing::info!("GENA dropping dead subscription SID={} cb={}", sid, sub.callback);
+            }
+            keep
+        });
+    }
 }
 
 fn transport_state_for_player(player_state: PlaybackState, has_media: bool) -> TransportState {
@@ -141,16 +169,17 @@ pub async fn run_http_server(
             tokio::time::sleep(sleep_duration).await;
 
             let player_c = player_clone.clone();
-            let (pos, dur, player_state) = tokio::task::spawn_blocking(move || {
+            let (pos, dur, player_state, vol_mute) = tokio::task::spawn_blocking(move || {
                 if let Ok(mut p) = player_c.lock() {
                     p.poll_sync();
                     let (pos, dur) = p.get_position();
-                    (pos, dur, p.get_state())
+                    (pos, dur, p.get_state(), p.get_volume_mute())
                 } else {
                     (
                         std::time::Duration::ZERO,
                         std::time::Duration::ZERO,
                         PlaybackState::Stopped,
+                        None,
                     )
                 }
             })
@@ -159,6 +188,7 @@ pub async fn run_http_server(
                 std::time::Duration::ZERO,
                 std::time::Duration::ZERO,
                 PlaybackState::Stopped,
+                None,
             ));
 
             last_player_state = player_state;
@@ -182,6 +212,20 @@ pub async fn run_http_server(
 
             if state_changed {
                 notify_avtransport(&poll_app_state).await;
+            }
+
+            // Volume/mute duplex: player window changes flow back to subscribers.
+            if let Some((vol, mute)) = vol_mute {
+                let rc_changed = {
+                    let mut state = av_state_clone.write().unwrap();
+                    let changed = state.volume != vol || state.mute != mute;
+                    state.volume = vol;
+                    state.mute = mute;
+                    changed
+                };
+                if rc_changed {
+                    notify_rendering(&poll_app_state).await;
+                }
             }
         }
     });
@@ -433,6 +477,7 @@ async fn handle_subscribe(state: AppState, headers: HeaderMap, uri: String) -> R
         let mut subs = state.subscriptions.write().unwrap();
         if let Some(sub) = subs.get_mut(&sid) {
             sub.timeout_secs = timeout_secs;
+            sub.failures = 0;
             tracing::info!("GENA renewal SID={} timeout={}", sid, timeout_secs);
             return (
                 StatusCode::OK,
@@ -465,9 +510,14 @@ async fn handle_subscribe(state: AppState, headers: HeaderMap, uri: String) -> R
         nt: nt.clone(),
         timeout_secs,
         seq: 0,
+        failures: 0,
     };
     {
         let mut subs = state.subscriptions.write().unwrap();
+        // A controller returning from a network drop re-subscribes with a new
+        // SID and often a new callback port. Drop stale duplicates so it
+        // doesn't receive two SEQ streams (or none, on the dead one).
+        subs.retain(|_, s| s.callback != callback_clean);
         subs.insert(sid.clone(), sub);
     }
     tracing::info!(
@@ -597,14 +647,21 @@ async fn send_notify(subs: &Arc<RwLock<HashMap<String, Subscription>>>, sid: &st
             .send()
             .await;
         match res {
-            Ok(r) => tracing::debug!("NOTIFY response status {}", r.status()),
-            Err(e) => tracing::warn!("NOTIFY failed to {}: {}", url, e),
+            Ok(r) => {
+                tracing::debug!("NOTIFY response status {}", r.status());
+                note_notify_result(subs, sid, true);
+            }
+            Err(e) => {
+                tracing::warn!("NOTIFY failed to {}: {}", url, e);
+                note_notify_result(subs, sid, false);
+            }
         }
     }
 }
 
 // Helper to notify all AVTransport subscribers
 pub async fn notify_avtransport(state: &AppState) {
+    purge_dead_subscriptions(&state.subscriptions);
     let av_state = state.av_state.read().unwrap().clone();
     let body_inner = xml::avtransport_last_change(&av_state);
     let body = format!(
@@ -613,7 +670,7 @@ pub async fn notify_avtransport(state: &AppState) {
     );
     let subs = state.subscriptions.read().unwrap().clone();
     for (sid, sub) in subs.iter() {
-        if sub.callback.is_empty() {
+        if sub.callback.is_empty() || sub.failures >= 5 {
             continue;
         }
         // Only notify AVTransport subs - heuristic: check if callback was from AVTransport? We don't track uri per sub.
@@ -647,7 +704,7 @@ pub async fn notify_avtransport(state: &AppState) {
                 .trim_matches('>')
                 .trim();
             let method = reqwest::Method::from_bytes(b"NOTIFY").unwrap();
-            let _ = client
+            let res = client
                 .request(method, url)
                 .header("NT", "upnp:event")
                 .header("NTS", "upnp:propchange")
@@ -657,11 +714,13 @@ pub async fn notify_avtransport(state: &AppState) {
                 .body(body_clone)
                 .send()
                 .await;
+            note_notify_result(&subs_clone, &sid_clone, res.is_ok());
         });
     }
 }
 
 pub async fn notify_rendering(state: &AppState) {
+    purge_dead_subscriptions(&state.subscriptions);
     let av_state = state.av_state.read().unwrap().clone();
     let body_inner = xml::rendering_last_change(&av_state);
     let body = format!(
@@ -670,6 +729,9 @@ pub async fn notify_rendering(state: &AppState) {
     );
     let subs = state.subscriptions.read().unwrap().clone();
     for (sid, sub) in subs.iter() {
+        if sub.callback.is_empty() || sub.failures >= 5 {
+            continue;
+        }
         let sid_clone = sid.clone();
         let cb = sub.callback.clone();
         let body_clone = body.clone();
@@ -691,16 +753,17 @@ pub async fn notify_rendering(state: &AppState) {
                 .unwrap();
             let url = cb.split(',').next().unwrap_or(&cb).trim();
             let method = reqwest::Method::from_bytes(b"NOTIFY").unwrap();
-            let _ = client
+            let res = client
                 .request(method, url)
                 .header("NT", "upnp:event")
                 .header("NTS", "upnp:propchange")
-                .header("SID", sid_clone)
+                .header("SID", sid_clone.clone())
                 .header("SEQ", seq.to_string())
                 .header("CONTENT-TYPE", "text/xml; charset=\"utf-8\"")
                 .body(body_clone)
                 .send()
                 .await;
+            note_notify_result(&subs_clone, &sid_clone, res.is_ok());
         });
     }
 }

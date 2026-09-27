@@ -212,6 +212,59 @@ pub fn vlc_candidates() -> Vec<PathBuf> {
     }
 }
 
+/// Candidate mpv binaries (after `$PATH` lookup).
+pub fn mpv_candidates() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        vec![
+            PathBuf::from(r"C:\Program Files\MPV Player\mpv.exe"),
+            PathBuf::from(r"C:\Program Files\mpv\mpv.exe"),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        vec![
+            PathBuf::from("/usr/bin/mpv"),
+            PathBuf::from("/usr/local/bin/mpv"),
+            PathBuf::from("/var/lib/flatpak/exports/bin/io.mpv.Mpv"),
+        ]
+    }
+}
+
+/// IPC endpoint mpv listens on. Unique per daemon process so a stale
+/// mpv from a previous run can never block a new one from binding.
+/// Windows uses a named pipe, Unix a socket file.
+pub fn mpv_ipc_endpoint() -> String {
+    let pid = std::process::id();
+    #[cfg(windows)]
+    {
+        format!(r"\\.\pipe\playpnp-mpv-{}", pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let uid = unsafe { libc::getuid() };
+        format!("/tmp/playpnp-mpv-{}-{}.sock", uid, pid)
+    }
+}
+
+/// mpv launch args for renderer use: stay idle with no window until a
+/// file is loaded, then fullscreen. English audio/subs preferred natively.
+pub fn mpv_args(ipc_endpoint: &str) -> Vec<String> {
+    vec![
+        "--idle=yes".to_string(),
+        "--force-window=no".to_string(),
+        "--fullscreen".to_string(),
+        "--no-terminal".to_string(),
+        format!("--input-ipc-server={}", ipc_endpoint),
+        "--slang=en,eng,English".to_string(),
+        "--alang=en,eng,English".to_string(),
+        "--sub-auto=all".to_string(),
+        // Like VLC's --no-video-title-show: no filename flash on the
+        // screen when a new file starts. Empty string disables it.
+        "--osd-playing-msg=".to_string(),
+    ]
+}
+
 /// VLC launch args for the RC interface. `intf` is `rc` normally,
 /// `oldrc` as fallback on Linux VLC 3.x where the module kept its old name.
 pub fn vlc_args(rc_port: u16, intf: &str) -> Vec<String> {
@@ -230,6 +283,12 @@ pub fn vlc_args(rc_port: u16, intf: &str) -> Vec<String> {
         "--live-caching=3000".to_string(),
         "--http-reconnect".to_string(),
         "--clock-jitter=5000".to_string(),
+        // Renderer use: never pop up the "Your input can't be opened"
+        // Errors dialog (e.g. when the phone serving the file sleeps and
+        // its HTTP server goes away). `qt-error-dialogs` defaults to true
+        // (modules/gui/qt/qt.cpp); the dialog's own "Hide future errors"
+        // checkbox flips the same setting.
+        "--no-qt-error-dialogs".to_string(),
     ];
     // `--rc-quiet` exists on Windows builds but makes Linux VLC 3.0.x
     // abort with "unknown option". Same for the D3D11 hint.
@@ -241,7 +300,98 @@ pub fn vlc_args(rc_port: u16, intf: &str) -> Vec<String> {
     args
 }
 
-/// `SERVER` header value for SSDP messages.
+/// Bring the VLC window to the foreground.
+/// Best-effort, never fails the build or playback — logs only on debug.
+pub fn focus_vlc(pid: Option<u32>) {
+    #[cfg(windows)]
+    {
+        windows_focus_vlc(pid);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        unix_focus_vlc();
+    }
+}
+
+#[cfg(windows)]
+fn windows_focus_vlc(pid: Option<u32>) {
+    // Raw user32 FFI — no extra deps, works with default features.
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(cb: unsafe extern "system" fn(u64, u64) -> i32, param: u64) -> i32;
+        fn GetWindowThreadProcessId(hwnd: u64, pid_out: *mut u32) -> u32;
+        fn IsWindowVisible(hwnd: u64) -> i32;
+        fn ShowWindow(hwnd: u64, cmd: i32) -> i32;
+        fn SetForegroundWindow(hwnd: u64) -> i32;
+        fn BringWindowToTop(hwnd: u64) -> i32;
+        fn GetWindowTextW(hwnd: u64, buf: *mut u16, max: i32) -> i32;
+    }
+    const SW_RESTORE: i32 = 9;
+
+    struct Ctx {
+        pid: Option<u32>,
+        found: Vec<u64>,
+    }
+
+    unsafe extern "system" fn enum_cb(hwnd: u64, param: u64) -> i32 {
+        let ctx = unsafe { &mut *(param as *mut Ctx) };
+        unsafe {
+            if IsWindowVisible(hwnd) == 0 {
+                return 1;
+            }
+            let mut wpid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, &mut wpid as *mut u32);
+            let matches = match ctx.pid {
+                Some(p) => wpid == p,
+                None => {
+                    // Fallback: match VLC window title when pid unknown.
+                    let mut buf = [0u16; 256];
+                    let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), 256);
+                    if n <= 0 {
+                        return 1;
+                    }
+                    let title = String::from_utf16_lossy(&buf[..n as usize]);
+                    let t = title.to_ascii_lowercase();
+                    t.contains("vlc")
+                }
+            };
+            if matches {
+                ctx.found.push(hwnd);
+            }
+        }
+        1
+    }
+
+    let mut ctx = Ctx {
+        pid,
+        found: Vec::new(),
+    };
+    unsafe {
+        EnumWindows(enum_cb, &mut ctx as *mut Ctx as u64);
+        for hwnd in ctx.found {
+            ShowWindow(hwnd, SW_RESTORE);
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn unix_focus_vlc() {
+    // Wayland/X11: try whatever raiser is installed. All best-effort.
+    for (prog, args) in [
+        ("xdotool", vec!["search", "--onlyvisible", "--class", "vlc", "windowactivate", "windowraise"]),
+        ("wmctrl", vec!["-a", "VLC"]),
+    ] {
+        let _ = std::process::Command::new(prog)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
 pub fn server_header() -> &'static str {
     #[cfg(windows)]
     {
@@ -285,6 +435,8 @@ mod tests {
     fn vlc_args_differ_per_os() {
         let args = vlc_args(52422, "rc");
         assert!(args.contains(&"--fullscreen".to_string()));
+        // Error popup must stay suppressed on every OS (phone-sleep disconnects).
+        assert!(args.contains(&"--no-qt-error-dialogs".to_string()));
         #[cfg(windows)]
         assert!(args.contains(&"--rc-quiet".to_string()));
         #[cfg(not(windows))]

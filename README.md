@@ -1,8 +1,8 @@
 # playpnp — cast videos from your phone to your PC
 
-`playpnp` turns your computer into a **DLNA MediaRenderer** (DMR) that shows up in **BubbleUPnP**, **mConnect**, and any UPnP/DLNA control point. Pick a video on your phone, hit cast — it plays on your PC in **real VLC**, with position tracking, seeking, volume, and pause/resume all in sync.
+`playpnp` turns your computer into a **DLNA MediaRenderer** (DMR) that shows up in **BubbleUPnP**, **mConnect**, and any UPnP/DLNA control point. Pick a video on your phone, hit cast — it plays on your PC in **real mpv** (VLC as fallback), with position tracking, seeking, volume, and pause/resume all in sync.
 
-Windows and Linux (Arch, Ubuntu). Single Rust binary — just add VLC. (On Linux the tray build uses system GTK/AppIndicator libs; the `--no-default-features` build is dependency-free.)
+Windows and Linux (Arch, Ubuntu). Single Rust binary — just add mpv (or VLC). (On Linux the tray build uses system GTK/AppIndicator libs; the `--no-default-features` build is dependency-free.)
 
 ---
 
@@ -30,7 +30,7 @@ Windows and Linux (Arch, Ubuntu). Single Rust binary — just add VLC. (On Linux
 
 ## ✨ Features
 
-- **Real VLC backend** — Play, Pause, Stop, Seek, Volume/Mute over VLC's RC interface (`127.0.0.1:52422`). Reuses one VLC instance across tracks, auto-closes it when idle. VLC is required.
+- **Real mpv backend, VLC fallback** — Play, Pause, Stop, Seek, Volume/Mute over mpv's JSON IPC. Millisecond clock, crash recovery with resume, volume changes in the player window sync back to the controller. If mpv isn't installed, the old VLC remote-control backend is used automatically (`-p mpv|vlc|auto` to choose).
 - **Synced timeline** — duration from DIDL metadata or VLC probing, sub-second interpolation capped so weak Wi-Fi never makes the timeline jump.
 - **Auto tracks** — prefers SDH English subtitles, then English; same for audio. Leaves your settings alone when there's no match.
 - **Dynamic `URLBase`** — `description.xml` answers from the request's `Host`, so multi-NIC machines always hand out reachable control/event URLs.
@@ -41,7 +41,7 @@ Windows and Linux (Arch, Ubuntu). Single Rust binary — just add VLC. (On Linux
 
 ## 🚀 Quick Start
 
-Prerequisites: install **VLC** (`https://www.videolan.org` on Windows, `vlc` package on Linux).
+Prerequisites: install **mpv** (`winget install -e --id shinchiro.mpv` on Windows, `mpv` package on Linux) — or VLC as fallback.
 
 ### Windows
 
@@ -98,6 +98,8 @@ systemctl --user enable --now playpnp
 | `PLAYPNP_BIND_IP` | Pin a local IPv4 address (e.g. `192.168.43.100`) |
 | `PLAYPNP_PEERS` | Extra IPs to unicast NOTIFY to, comma-separated (e.g. `192.168.43.1`) |
 | `RUST_LOG` | Log level (`debug`, `info`, `warn`) |
+
+Player backend is chosen with `-p` / `--player` (`mpv`, `vlc`, or `auto` = mpv first, VLC fallback). Examples: `playpnp -p vlc serve`, `playpnp --player=mpv`.
 
 Extra peers can also live in `peers.txt` — `%APPDATA%\playpnp\peers.txt` on Windows, `~/.config/playpnp/peers.txt` on Linux (one IP per line). The dashboard can add peers at runtime too. Device identity (`uuid`) persists next to it.
 

@@ -3,6 +3,7 @@ use std::time::Duration;
 
 pub mod external;
 pub mod mock;
+pub mod mpv;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackState {
@@ -23,14 +24,53 @@ pub trait MediaPlayer: Send {
     fn set_mute(&mut self, mute: bool) -> anyhow::Result<()>;
     fn get_position(&self) -> (Duration, Duration);
     fn get_state(&self) -> PlaybackState;
+    fn get_volume_mute(&self) -> Option<(u8, bool)> {
+        None
+    }
     #[allow(dead_code)]
     fn current_uri(&self) -> String;
     fn poll_sync(&mut self) {}
 }
 
 pub fn create_player() -> Arc<Mutex<Box<dyn MediaPlayer>>> {
-    tracing::info!("Using VLC player backend (VLC is required for playback)");
+    if find_mpv().is_some() {
+        tracing::info!("Using mpv player backend (VLC as fallback)");
+        return Arc::new(Mutex::new(Box::new(mpv::MpvPlayer::new())));
+    }
+    tracing::info!("mpv not found, using VLC player backend (VLC is required for playback)");
     Arc::new(Mutex::new(Box::new(external::VlcPlayer::new())))
+}
+
+// Force a backend via PLAYPNP_PLAYER=mpv|vlc (default: auto = mpv first).
+pub fn create_player_forced(backend: &str) -> Arc<Mutex<Box<dyn MediaPlayer>>> {
+    match backend.to_ascii_lowercase().as_str() {
+        "vlc" => Arc::new(Mutex::new(Box::new(external::VlcPlayer::new()))),
+        "mpv" => Arc::new(Mutex::new(Box::new(mpv::MpvPlayer::new()))),
+        _ => create_player(),
+    }
+}
+
+pub fn player_backend_name() -> &'static str {
+    if find_mpv().is_some() {
+        "mpv"
+    } else {
+        "vlc"
+    }
+}
+
+/// Locate mpv ($PATH first, then well-known install folders).
+pub fn find_mpv() -> Option<std::path::PathBuf> {
+    for name in ["mpv", "mpv.exe"] {
+        if let Ok(path) = which::which(name) {
+            return Some(path);
+        }
+    }
+    for c in crate::platform::mpv_candidates() {
+        if c.exists() {
+            return Some(c);
+        }
+    }
+    None
 }
 
 // Helper to detect VLC installation (cross-platform: $PATH + known locations).

@@ -19,6 +19,11 @@ pub struct VlcPlayer {
     volume: u8,
     mute: bool,
     transition_start: Option<Instant>,
+    // Dead-input detection: VLC keeps reporting Playing while the clock is
+    // frozen (e.g. phone hotspot dropped mid-stream). last_advance tracks
+    // the last clock movement; stalled flips after 15s of no movement.
+    last_advance: Instant,
+    stalled: bool,
     subtitles_checked: bool,
     audio_checked: bool,
     stopped_at: Option<Instant>,
@@ -44,6 +49,8 @@ impl VlcPlayer {
             subtitles_checked: false,
             audio_checked: false,
             stopped_at: None,
+            last_advance: Instant::now(),
+            stalled: false,
         }
     }
 
@@ -110,6 +117,10 @@ impl VlcPlayer {
                 tracing::info!("Connected to VLC RC interface (intf={})", intf);
                 let vlc_vol = (self.volume as u32 * 256) / 100;
                 let _ = self.send_cmd(&format!("volume {}", vlc_vol));
+                // VLC spawns behind other windows when launched from the
+                // background daemon — bring it to the foreground.
+                let pid = self.child.as_ref().map(|c| c.id());
+                crate::platform::focus_vlc(pid);
                 return true;
             }
             tracing::warn!(
@@ -219,6 +230,12 @@ impl VlcPlayer {
         self.audio_checked = false;
     }
 
+    fn transition_timed_out(&self) -> bool {
+        self.transition_start
+            .map(|start| start.elapsed() > Duration::from_secs(35))
+            .unwrap_or(false)
+    }
+
     fn poll_sync_internal(&mut self) {
         // VLC is authoritative.  Poll while paused/stopped as well so a
         // click in VLC's own window is reflected in the DLNA state.
@@ -244,10 +261,7 @@ impl VlcPlayer {
         let active = parse_rc_bool(&active_res);
 
         // Allow up to 35 seconds for initial connection & buffer fill
-        let transition_timed_out = self
-            .transition_start
-            .map(|start| start.elapsed() > Duration::from_secs(35))
-            .unwrap_or(false);
+        let transition_timed_out = self.transition_timed_out();
         // During the first 3 seconds of a new track loading, ignore transient "stopped" lines from VLC
         let just_started_transition = self
             .transition_start
@@ -433,6 +447,28 @@ impl VlcPlayer {
                 }
             }
         }
+
+        // Dead-input detection: VLC still reports Playing but the clock never
+        // advances (phone hotspot dropped mid-stream). Report buffering so the
+        // phone shows a spinner instead of a frozen timeline, start the
+        // transition timeout so it eventually settles to Stopped, and let the
+        // next Play heal it with a fresh re-add.
+        if self.state == PlaybackState::Playing && self.position > previous_position {
+            self.last_advance = Instant::now();
+            self.stalled = false;
+        } else if self.state == PlaybackState::Playing
+            && self.duration > Duration::ZERO
+            && self.last_advance.elapsed() > Duration::from_secs(15)
+        {
+            if !self.stalled {
+                tracing::warn!("VLC clock frozen 15s while Playing, treating input as stalled");
+            }
+            self.stalled = true;
+            self.state = PlaybackState::Transitioning;
+            if self.transition_start.is_none() {
+                self.transition_start = Some(Instant::now());
+            }
+        }
     }
 }
 
@@ -505,6 +541,8 @@ impl MediaPlayer for VlcPlayer {
         self.position = Duration::from_secs(0);
         self.duration = Duration::from_secs(0);
         self.last_pos_time = Instant::now();
+        self.last_advance = Instant::now();
+        self.stalled = false;
         self.pending_seek = None;
         self.state = PlaybackState::Stopped;
         self.transition_start = None;
@@ -533,9 +571,13 @@ impl MediaPlayer for VlcPlayer {
                 self.last_pos_time = Instant::now();
             }
             PlaybackState::Playing | PlaybackState::Transitioning
-                if self.loaded_uri.as_deref() == Some(self.uri.as_str()) =>
+                if self.loaded_uri.as_deref() == Some(self.uri.as_str())
+                    && !self.stalled
+                    && !self.transition_timed_out() =>
             {
-                // Play is idempotent.
+                // Play is idempotent, but only for a healthy input. A stalled
+                // or long-buffering input (dead hotspot stream) must be
+                // re-added below or controls keep hitting a dead item.
             }
             _ => {
                 tracing::info!("VlcPlayer starting playback for {}", self.uri);
@@ -544,11 +586,17 @@ impl MediaPlayer for VlcPlayer {
                     self.disconnect();
                     anyhow::bail!("VLC remote-control connection was lost");
                 }
+                // Re-focus on every new item too: reused VLC instance may
+                // still be behind the browser / other windows.
+                let pid = self.child.as_ref().map(|c| c.id());
+                crate::platform::focus_vlc(pid);
                 self.loaded_uri = Some(self.uri.clone());
                 self.state = PlaybackState::Transitioning;
                 self.transition_start = Some(Instant::now());
                 self.stopped_at = None;
                 self.last_pos_time = Instant::now();
+                self.last_advance = Instant::now();
+                self.stalled = false;
                 self.subtitles_checked = false;
                 self.audio_checked = false;
 
@@ -583,6 +631,8 @@ impl MediaPlayer for VlcPlayer {
         self.stopped_at = Some(Instant::now());
         self.position = Duration::from_secs(0);
         self.last_pos_time = Instant::now();
+        self.last_advance = Instant::now();
+        self.stalled = false;
         self.pending_seek = None;
         self.loaded_uri = None;
         self.transition_start = None;
