@@ -17,7 +17,6 @@ pub struct MpvPlayer {
     loaded_uri: Option<String>,
     duration: Duration,
     position: Duration,
-    last_pos_time: Instant,
     state: PlaybackState,
     volume: u8,
     mute: bool,
@@ -38,7 +37,6 @@ impl MpvPlayer {
             loaded_uri: None,
             duration: Duration::ZERO,
             position: Duration::ZERO,
-            last_pos_time: Instant::now(),
             state: PlaybackState::Stopped,
             volume: 100,
             mute: false,
@@ -159,13 +157,22 @@ impl MpvPlayer {
     }
 
     fn roundtrip(&self, lines: Vec<String>, expect: usize, timeout: Duration) -> Option<Vec<String>> {
-        let mut conn = Conn::open(&self.ipc_endpoint)?;
-        for line in &lines {
-            if conn.write_line(line).is_err() {
-                return None;
-            }
-        }
-        conn.read_lines_timeout(expect, timeout)
+        // Open/write have no OS timeout on a wedged pipe; bound the whole
+        // exchange so stuck mpv IPC can never hang the player mutex (and
+        // with it, every DLNA action) past this.
+        let endpoint = self.ipc_endpoint.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let reply = (|| {
+                let mut conn = Conn::open(&endpoint)?;
+                for line in &lines {
+                    conn.write_line(line).ok()?;
+                }
+                conn.read_lines_timeout(expect, timeout)
+            })();
+            let _ = tx.send(reply);
+        });
+        rx.recv_timeout(timeout + Duration::from_secs(1)).ok()?
     }
 
     fn query_props(&mut self) -> Option<MpvSnapshot> {
@@ -195,10 +202,9 @@ impl MpvPlayer {
         self.loaded_uri = Some(self.uri.clone());
         self.state = PlaybackState::Transitioning;
         self.transition_start = Some(Instant::now());
-        self.last_pos_time = Instant::now();
         // Reused mpv instance may sit behind other windows.
         let pid = self.child.as_ref().map(|c| c.id());
-        crate::platform::focus_mpv(pid);
+        crate::platform::focus_mpv_when_ready(pid);
     }
 
     fn restore_after_respawn(&mut self, resume_pos: Duration, was_paused: bool) {
@@ -239,7 +245,6 @@ impl MpvPlayer {
             let _ = self.roundtrip(vec![payload.to_string()], 1, QUERY_TIMEOUT);
             self.state = PlaybackState::Paused;
         }
-        self.last_pos_time = Instant::now();
     }
 
     fn ensure_mpv(&mut self) -> bool {
@@ -316,13 +321,11 @@ impl MpvPlayer {
             self.position = Duration::ZERO;
             self.loaded_uri = None;
             self.transition_start = None;
-            self.last_pos_time = Instant::now();
             return;
         }
         if snap.idle == Some(true) {
             if self.state != PlaybackState::Stopped {
                 self.state = PlaybackState::Stopped;
-                self.last_pos_time = Instant::now();
             }
             self.transition_start = None;
             return;
@@ -335,7 +338,6 @@ impl MpvPlayer {
         }
         if let Some(t) = snap.time_pos {
             self.position = t;
-            self.last_pos_time = Instant::now();
         }
 
         let next = match (snap.pause, self.loaded_uri.is_some()) {
@@ -452,7 +454,6 @@ impl MediaPlayer for MpvPlayer {
         self.duration = Duration::ZERO;
         self.state = PlaybackState::Stopped;
         self.transition_start = None;
-        self.last_pos_time = Instant::now();
     }
 
     fn play(&mut self) -> anyhow::Result<()> {
@@ -467,7 +468,6 @@ impl MediaPlayer for MpvPlayer {
             let payload = serde_json::json!({"command": ["set_property", "pause", false], "request_id": id});
             let _ = self.roundtrip(vec![payload.to_string()], 1, QUERY_TIMEOUT);
             self.state = PlaybackState::Playing;
-            self.last_pos_time = Instant::now();
             return Ok(());
         }
         if matches!(self.state, PlaybackState::Playing | PlaybackState::Transitioning)
@@ -485,7 +485,6 @@ impl MediaPlayer for MpvPlayer {
             let payload = serde_json::json!({"command": ["set_property", "pause", true], "request_id": id});
             let _ = self.roundtrip(vec![payload.to_string()], 1, QUERY_TIMEOUT);
             self.state = PlaybackState::Paused;
-            self.last_pos_time = Instant::now();
         }
         Ok(())
     }
@@ -498,7 +497,6 @@ impl MediaPlayer for MpvPlayer {
         self.position = Duration::ZERO;
         self.loaded_uri = None;
         self.transition_start = None;
-        self.last_pos_time = Instant::now();
         Ok(())
     }
 
@@ -518,7 +516,6 @@ impl MediaPlayer for MpvPlayer {
         });
         let _ = self.roundtrip(vec![payload.to_string()], 1, QUERY_TIMEOUT);
         self.position = target;
-        self.last_pos_time = Instant::now();
         Ok(())
     }
 
@@ -539,17 +536,8 @@ impl MediaPlayer for MpvPlayer {
     }
 
     fn get_position(&self) -> (Duration, Duration) {
-        if self.state == PlaybackState::Playing {
-            let extra = self.last_pos_time.elapsed().min(Duration::from_millis(500));
-            let estimated = self.position + extra;
-            if self.duration > Duration::ZERO && estimated > self.duration {
-                (self.duration, self.duration)
-            } else {
-                (estimated, self.duration)
-            }
-        } else {
-            (self.position, self.duration)
-        }
+        // Last IPC sample verbatim; GetPositionInfo smooths from last_updated.
+        (self.position, self.duration)
     }
 
     fn get_state(&self) -> PlaybackState {
@@ -740,6 +728,17 @@ mod tests {
         let snap = parse_snapshot(&lines, &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(snap.time_pos, None);
         assert_eq!(snap.idle, Some(true));
+    }
+
+    #[test]
+    fn get_position_returns_last_sample_verbatim() {
+        let mut p = MpvPlayer::new(true);
+        p.state = PlaybackState::Playing;
+        p.position = Duration::from_secs(10);
+        p.duration = Duration::from_secs(100);
+        let (pos, dur) = p.get_position();
+        assert_eq!(pos, Duration::from_secs(10));
+        assert_eq!(dur, Duration::from_secs(100));
     }
 
     // Live drive test against real mpv. Needs mpv installed + sample file.

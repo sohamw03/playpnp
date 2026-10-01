@@ -312,20 +312,31 @@ pub fn focus_vlc(pid: Option<u32>) {
     focus_player(pid, "vlc");
 }
 
-/// Bring the mpv window to the foreground (same deal as VLC).
-pub fn focus_mpv(pid: Option<u32>) {
-    focus_player(pid, "mpv");
+/// mpv creates its window async after `loadfile`; retry until it exists.
+pub fn focus_mpv_when_ready(pid: Option<u32>) {
+    std::thread::spawn(move || {
+        #[cfg(windows)]
+        let (tries, wait) = (60, std::time::Duration::from_millis(200));
+        #[cfg(not(windows))]
+        let (tries, wait) = (6, std::time::Duration::from_secs(1));
+        for _ in 0..tries {
+            if focus_player(pid, "mpv") {
+                return;
+            }
+            std::thread::sleep(wait);
+        }
+    });
 }
 
-fn focus_player(pid: Option<u32>, title_match: &'static str) {
+fn focus_player(pid: Option<u32>, title_match: &'static str) -> bool {
     #[cfg(windows)]
     {
-        windows_focus_player(pid, title_match);
+        windows_focus_player(pid, title_match)
     }
     #[cfg(not(windows))]
     {
         let _ = pid;
-        unix_focus_player(title_match);
+        unix_focus_player(title_match)
     }
 }
 
@@ -361,7 +372,7 @@ unsafe extern "system" {
 }
 
 #[cfg(windows)]
-fn windows_focus_player(pid: Option<u32>, title_match: &'static str) {
+fn windows_focus_player(pid: Option<u32>, title_match: &'static str) -> bool {
     struct Ctx {
         pid: Option<u32>,
         title_match: &'static str,
@@ -403,9 +414,10 @@ fn windows_focus_player(pid: Option<u32>, title_match: &'static str) {
     };
     unsafe {
         EnumWindows(enum_cb, &mut ctx as *mut Ctx as u64);
-        for hwnd in ctx.found {
-            force_foreground(hwnd);
+        for hwnd in &ctx.found {
+            force_foreground(*hwnd);
         }
+        !ctx.found.is_empty()
     }
 }
 
@@ -471,9 +483,10 @@ unsafe fn force_foreground(hwnd: u64) {
 }
 
 #[cfg(not(windows))]
-fn unix_focus_player(title_match: &str) {
+fn unix_focus_player(title_match: &str) -> bool {
     // Wayland/X11: try whatever raiser is installed. All best-effort.
     let wm_name = if title_match == "mpv" { "mpv" } else { "VLC" };
+    let mut raised = false;
     for (prog, args) in [
         (
             "xdotool",
@@ -488,13 +501,16 @@ fn unix_focus_player(title_match: &str) {
         ),
         ("wmctrl", vec!["-a", wm_name]),
     ] {
-        let _ = std::process::Command::new(prog)
+        raised |= std::process::Command::new(prog)
             .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
     }
+    raised
 }
 pub fn server_header() -> &'static str {
     #[cfg(windows)]
@@ -555,5 +571,12 @@ mod tests {
         assert!(args.contains(&"--rc-quiet".to_string()));
         #[cfg(not(windows))]
         assert!(!args.contains(&"--rc-quiet".to_string()));
+    }
+
+    #[test]
+    fn focus_when_ready_returns_immediately() {
+        let start = std::time::Instant::now();
+        focus_mpv_when_ready(Some(u32::MAX));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 }

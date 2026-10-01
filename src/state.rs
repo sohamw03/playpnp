@@ -33,6 +33,8 @@ pub struct AVState {
     pub volume: u8, // 0-100
     pub mute: bool,
     pub track: u32,
+    /// Last seek-related LastChange, for the poll loop's notify cooldown.
+    pub last_seek_event: Instant,
     #[allow(dead_code)]
     pub last_change_seq: u32,
     #[allow(dead_code)]
@@ -53,6 +55,7 @@ impl Default for AVState {
             volume: 100,
             mute: false,
             track: 0,
+            last_seek_event: Instant::now(),
             last_change_seq: 0,
             last_updated: Instant::now(),
             seekable: true,

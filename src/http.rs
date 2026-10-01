@@ -76,6 +76,28 @@ fn transport_state_for_player(player_state: PlaybackState, has_media: bool) -> T
     }
 }
 
+// Jump vs. expected clock that counts as a PC-side seek. Normal playback
+// advances ~poll interval between samples; 3s clears jitter, catches seeks.
+const SEEK_JUMP_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(3);
+// Min gap between seek-triggered events so slider scrubbing stays periodic.
+const SEEK_NOTIFY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Fresh sample too far from the expected clock (frozen while paused) for
+/// normal playback — i.e. someone sought outside DLNA.
+fn is_external_seek(
+    prev_pos: std::time::Duration,
+    elapsed: std::time::Duration,
+    was_playing: bool,
+    new_pos: std::time::Duration,
+) -> bool {
+    let expected = if was_playing {
+        prev_pos + elapsed
+    } else {
+        prev_pos
+    };
+    new_pos.abs_diff(expected) > SEEK_JUMP_THRESHOLD
+}
+
 pub async fn run_http_server(
     config: Config,
     local_ip: IpAddr,
@@ -148,7 +170,7 @@ pub async fn run_http_server(
             .unwrap();
     });
 
-    // Poll VLC's authoritative state and clock with adaptive intervals
+    // Poll the player's authoritative state and clock with adaptive intervals
     // and offloaded to spawn_blocking to avoid blocking Tokio worker threads.
     let av_state_clone = av_state.clone();
     let player_clone = player.clone();
@@ -198,6 +220,20 @@ pub async fn run_http_server(
                 let mapped =
                     transport_state_for_player(player_state, !state.current_uri.is_empty());
                 let changed = state.transport_state != mapped;
+                let now = std::time::Instant::now();
+                let had_media = !state.current_uri.is_empty();
+                let was_playing = state.transport_state == TransportState::Playing;
+                let elapsed = now.duration_since(state.last_updated);
+
+                // PC-side seeks leave TransportState unchanged, so `changed`
+                // stays false and controllers keep a stale timeline. Emit a
+                // LastChange (carries RelativeTimePosition) on the jump.
+                let external_seek = had_media
+                    && !changed
+                    && matches!(player_state, PlaybackState::Playing | PlaybackState::Paused)
+                    && is_external_seek(state.position, elapsed, was_playing, pos)
+                    && now.duration_since(state.last_seek_event) >= SEEK_NOTIFY_COOLDOWN;
+
                 state.position = pos;
                 if dur > std::time::Duration::ZERO {
                     state.duration = dur;
@@ -206,8 +242,13 @@ pub async fn run_http_server(
                     state.transport_state = mapped;
                     state.last_change_seq = state.last_change_seq.wrapping_add(1);
                 }
-                state.last_updated = std::time::Instant::now();
-                changed
+                if external_seek {
+                    tracing::info!("PC seek: notifying subscribers (pos={:?})", pos);
+                    state.last_seek_event = now;
+                    state.last_change_seq = state.last_change_seq.wrapping_add(1);
+                }
+                state.last_updated = now;
+                changed || external_seek
             };
 
             if state_changed {
@@ -1079,6 +1120,7 @@ async fn handle_avtransport(
                 if duration > std::time::Duration::ZERO {
                     av.duration = duration;
                 }
+                av.last_seek_event = std::time::Instant::now();
                 av.last_change_seq = av.last_change_seq.wrapping_add(1);
                 av.last_updated = std::time::Instant::now();
             }
@@ -1178,4 +1220,84 @@ fn xml_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn normal_playback_advance_is_not_a_seek() {
+        assert!(!is_external_seek(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            true,
+            Duration::from_millis(10_500),
+        ));
+        assert!(!is_external_seek(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            true,
+            Duration::from_millis(11_500),
+        ));
+    }
+
+    #[test]
+    fn pc_seek_while_playing_is_detected() {
+        assert!(is_external_seek(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            true,
+            Duration::from_secs(70),
+        ));
+        assert!(is_external_seek(
+            Duration::from_secs(70),
+            Duration::from_millis(500),
+            true,
+            Duration::from_secs(10),
+        ));
+    }
+
+    #[test]
+    fn pc_seek_while_paused_is_detected() {
+        assert!(is_external_seek(
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            false,
+            Duration::from_secs(60),
+        ));
+        assert!(!is_external_seek(
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            false,
+            Duration::from_secs(10),
+        ));
+    }
+
+    #[test]
+    fn threshold_boundary() {
+        assert!(!is_external_seek(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            true,
+            Duration::from_millis(13_500),
+        ));
+        assert!(is_external_seek(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            true,
+            Duration::from_millis(13_600),
+        ));
+    }
+
+    #[test]
+    fn fresh_track_start_is_not_a_seek() {
+        assert!(!is_external_seek(
+            Duration::ZERO,
+            Duration::from_millis(500),
+            true,
+            Duration::from_millis(400),
+        ));
+    }
 }
