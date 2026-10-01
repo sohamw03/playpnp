@@ -37,6 +37,7 @@ fn main() -> anyhow::Result<()> {
     //   playpnp -p vlc serve | playpnp serve --player=mpv
     // Precedence: CLI flag, otherwise auto (mpv first, VLC fallback).
     let mut player_backend = "auto".to_string();
+    let mut night_mode = true;
     let mut args: Vec<String> = Vec::new();
     let mut raw = std::env::args().skip(1).peekable();
     while let Some(a) = raw.next() {
@@ -50,6 +51,10 @@ fn main() -> anyhow::Result<()> {
             }
         } else if let Some(v) = a.strip_prefix("--player=") {
             player_backend = v.to_string();
+        } else if a == "--night-mode" {
+            night_mode = true;
+        } else if a == "--no-night-mode" {
+            night_mode = false;
         } else if let Some(v) = a.strip_prefix("-p=") {
             player_backend = v.to_string();
         } else {
@@ -134,13 +139,22 @@ fn main() -> anyhow::Result<()> {
                     player_backend.clone()
                 }
             );
+            println!(
+                "  Night mode (even volume): {} (change with --night-mode/--no-night-mode)",
+                if night_mode { "on" } else { "off" }
+            );
             println!("  Dashboard: http://{}:<port>/ after startup", local_ip);
             println!("  Press Ctrl+C or run 'playpnp stop' to stop.");
 
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            match rt.block_on(run_daemon(config, local_ip, player_backend.clone())) {
+            match rt.block_on(run_daemon(
+                config,
+                local_ip,
+                player_backend.clone(),
+                night_mode,
+            )) {
                 Ok(()) => {}
                 Err(e) if is_singleton_conflict(&e) => exit_already_running(),
                 Err(e) => return Err(e),
@@ -179,7 +193,7 @@ fn main() -> anyhow::Result<()> {
 
             #[cfg(feature = "tray")]
             {
-                match run_with_tray(config, local_ip, player_backend.clone()) {
+                match run_with_tray(config, local_ip, player_backend.clone(), night_mode) {
                     Ok(()) => {}
                     Err(e) if is_singleton_conflict(&e) => return Ok(()),
                     Err(e) => return Err(e),
@@ -190,7 +204,12 @@ fn main() -> anyhow::Result<()> {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?;
-                match rt.block_on(run_daemon(config, local_ip, player_backend.clone())) {
+                match rt.block_on(run_daemon(
+                config,
+                local_ip,
+                player_backend.clone(),
+                night_mode,
+            )) {
                     Ok(()) => {}
                     Err(e) if is_singleton_conflict(&e) => return Ok(()),
                     Err(e) => return Err(e),
@@ -246,7 +265,7 @@ fn main() -> anyhow::Result<()> {
         }
         "" | "start" => {
             // Default: start background daemon silently with 📺 tray icon.
-            if start_background_daemon(&player_backend)? {
+            if start_background_daemon(&player_backend, night_mode)? {
                 println!("PlayPnP Started");
             } else {
                 println!("PlayPnP Already Running");
@@ -263,7 +282,7 @@ fn main() -> anyhow::Result<()> {
 
 /// Returns true when a daemon is (now) running because of this call,
 /// false when one was already running.
-fn start_background_daemon(player_backend: &str) -> anyhow::Result<bool> {
+fn start_background_daemon(player_backend: &str, night_mode: bool) -> anyhow::Result<bool> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -279,6 +298,11 @@ fn start_background_daemon(player_backend: &str) -> anyhow::Result<bool> {
     cmd.arg("__daemon")
         .arg("-p")
         .arg(player_backend)
+        .arg(if night_mode {
+            "--night-mode"
+        } else {
+            "--no-night-mode"
+        })
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -439,6 +463,7 @@ Usage:
   playpnp version  Show version
 
   -p, --player <mpv|vlc|auto>  Player backend (default: auto = mpv first, VLC fallback)
+  --night-mode / --no-night-mode  Even out loud/quiet passages, TV-style (default: on, mpv only)
 
 Features:
   - 📺 System tray icon with status link and quit menu (falls back to headless)
@@ -454,6 +479,7 @@ fn run_with_tray(
     config: Config,
     local_ip: std::net::IpAddr,
     player_backend: String,
+    night_mode: bool,
 ) -> anyhow::Result<()> {
     use std::sync::mpsc;
 
@@ -473,6 +499,7 @@ fn run_with_tray(
             config,
             local_ip,
             player_backend,
+            night_mode,
             port_tx,
             shutdown_tx_daemon,
             shutdown_rx_daemon,
@@ -516,6 +543,7 @@ fn run_with_tray(
     _config: Config,
     _local_ip: std::net::IpAddr,
     _player_backend: String,
+    _night_mode: bool,
 ) -> anyhow::Result<()> {
     anyhow::bail!("tray feature disabled")
 }
@@ -524,6 +552,7 @@ async fn run_daemon(
     config: Config,
     local_ip: std::net::IpAddr,
     player_backend: String,
+    night_mode: bool,
 ) -> anyhow::Result<()> {
     let (port_tx, _port_rx) = std::sync::mpsc::channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -531,6 +560,7 @@ async fn run_daemon(
         config,
         local_ip,
         player_backend,
+        night_mode,
         port_tx,
         shutdown_tx,
         shutdown_rx,
@@ -542,6 +572,7 @@ async fn run_daemon_with_channels(
     config: Config,
     local_ip: std::net::IpAddr,
     player_backend: String,
+    night_mode: bool,
     port_notify: std::sync::mpsc::Sender<u16>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
@@ -560,7 +591,7 @@ async fn run_daemon_with_channels(
     })?;
 
     let av_state = new_shared_state();
-    let player = player::create_player_forced(&player_backend);
+    let player = player::create_player(&player_backend, night_mode);
 
     let shutdown_rx_http = shutdown_rx.clone();
     let shutdown_rx_ssdp = shutdown_rx.clone();

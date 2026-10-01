@@ -32,21 +32,20 @@ pub trait MediaPlayer: Send {
     fn poll_sync(&mut self) {}
 }
 
-pub fn create_player() -> Arc<Mutex<Box<dyn MediaPlayer>>> {
-    if find_mpv().is_some() {
-        tracing::info!("Using mpv player backend (VLC as fallback)");
-        return Arc::new(Mutex::new(Box::new(mpv::MpvPlayer::new())));
-    }
-    tracing::info!("mpv not found, using VLC player backend (VLC is required for playback)");
-    Arc::new(Mutex::new(Box::new(external::VlcPlayer::new())))
-}
-
-// Force a backend via PLAYPNP_PLAYER=mpv|vlc (default: auto = mpv first).
-pub fn create_player_forced(backend: &str) -> Arc<Mutex<Box<dyn MediaPlayer>>> {
+// Backend from -p/--player (mpv|vlc|auto = mpv first); night_mode evens
+// loud/quiet passages via mpv's loudness filter (mpv only).
+pub fn create_player(backend: &str, night_mode: bool) -> Arc<Mutex<Box<dyn MediaPlayer>>> {
     match backend.to_ascii_lowercase().as_str() {
         "vlc" => Arc::new(Mutex::new(Box::new(external::VlcPlayer::new()))),
-        "mpv" => Arc::new(Mutex::new(Box::new(mpv::MpvPlayer::new()))),
-        _ => create_player(),
+        "mpv" => Arc::new(Mutex::new(Box::new(mpv::MpvPlayer::new(night_mode)))),
+        _ => {
+            if find_mpv().is_some() {
+                tracing::info!("Using mpv player backend (VLC as fallback)");
+                return Arc::new(Mutex::new(Box::new(mpv::MpvPlayer::new(night_mode))));
+            }
+            tracing::info!("mpv not found, using VLC player backend");
+            Arc::new(Mutex::new(Box::new(external::VlcPlayer::new())))
+        }
     }
 }
 

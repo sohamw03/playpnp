@@ -249,8 +249,10 @@ pub fn mpv_ipc_endpoint() -> String {
 
 /// mpv launch args for renderer use: stay idle with no window until a
 /// file is loaded, then fullscreen. English audio/subs preferred natively.
-pub fn mpv_args(ipc_endpoint: &str) -> Vec<String> {
-    vec![
+/// `night_mode` adds a loudness-evening filter (quiet dialogue up, loud
+/// music down) so movies sound even like on TVs.
+pub fn mpv_args(ipc_endpoint: &str, night_mode: bool) -> Vec<String> {
+    let mut args = vec![
         "--idle=yes".to_string(),
         "--force-window=no".to_string(),
         "--fullscreen".to_string(),
@@ -262,7 +264,11 @@ pub fn mpv_args(ipc_endpoint: &str) -> Vec<String> {
         // Like VLC's --no-video-title-show: no filename flash on the
         // screen when a new file starts. Empty string disables it.
         "--osd-playing-msg=".to_string(),
-    ]
+    ];
+    if night_mode {
+        args.push("--af=dynaudnorm".to_string());
+    }
+    args
 }
 
 /// VLC launch args for the RC interface. `intf` is `rc` normally,
@@ -301,36 +307,64 @@ pub fn vlc_args(rc_port: u16, intf: &str) -> Vec<String> {
 }
 
 /// Bring the VLC window to the foreground.
-/// Best-effort, never fails the build or playback — logs only on debug.
+/// Best-effort, never fails the build or playback.
 pub fn focus_vlc(pid: Option<u32>) {
+    focus_player(pid, "vlc");
+}
+
+/// Bring the mpv window to the foreground (same deal as VLC).
+pub fn focus_mpv(pid: Option<u32>) {
+    focus_player(pid, "mpv");
+}
+
+fn focus_player(pid: Option<u32>, title_match: &'static str) {
     #[cfg(windows)]
     {
-        windows_focus_vlc(pid);
+        windows_focus_player(pid, title_match);
     }
     #[cfg(not(windows))]
     {
         let _ = pid;
-        unix_focus_vlc();
+        unix_focus_player(title_match);
     }
 }
 
+// Raw user32/kernel32 FFI — no extra deps, works with default features.
+// Declared once at module level; shared by the focus helpers below.
 #[cfg(windows)]
-fn windows_focus_vlc(pid: Option<u32>) {
-    // Raw user32 FFI — no extra deps, works with default features.
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn EnumWindows(cb: unsafe extern "system" fn(u64, u64) -> i32, param: u64) -> i32;
-        fn GetWindowThreadProcessId(hwnd: u64, pid_out: *mut u32) -> u32;
-        fn IsWindowVisible(hwnd: u64) -> i32;
-        fn ShowWindow(hwnd: u64, cmd: i32) -> i32;
-        fn SetForegroundWindow(hwnd: u64) -> i32;
-        fn BringWindowToTop(hwnd: u64) -> i32;
-        fn GetWindowTextW(hwnd: u64, buf: *mut u16, max: i32) -> i32;
-    }
-    const SW_RESTORE: i32 = 9;
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn EnumWindows(cb: unsafe extern "system" fn(u64, u64) -> i32, param: u64) -> i32;
+    fn GetWindowThreadProcessId(hwnd: u64, pid_out: *mut u32) -> u32;
+    fn IsWindowVisible(hwnd: u64) -> i32;
+    fn ShowWindow(hwnd: u64, cmd: i32) -> i32;
+    fn SetForegroundWindow(hwnd: u64) -> i32;
+    fn BringWindowToTop(hwnd: u64) -> i32;
+    fn SetFocus(hwnd: u64) -> u64;
+    fn GetForegroundWindow() -> u64;
+    fn AttachThreadInput(attach_to: u32, attach_from: u32, attach: i32) -> i32;
+    fn SetWindowPos(
+        hwnd: u64,
+        hwnd_after: u64,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    ) -> i32;
+    fn GetWindowTextW(hwnd: u64, buf: *mut u16, max: i32) -> i32;
+}
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentThreadId() -> u32;
+}
 
+#[cfg(windows)]
+fn windows_focus_player(pid: Option<u32>, title_match: &'static str) {
     struct Ctx {
         pid: Option<u32>,
+        title_match: &'static str,
         found: Vec<u64>,
     }
 
@@ -345,15 +379,14 @@ fn windows_focus_vlc(pid: Option<u32>) {
             let matches = match ctx.pid {
                 Some(p) => wpid == p,
                 None => {
-                    // Fallback: match VLC window title when pid unknown.
+                    // Fallback: match window title when pid unknown.
                     let mut buf = [0u16; 256];
                     let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), 256);
                     if n <= 0 {
                         return 1;
                     }
                     let title = String::from_utf16_lossy(&buf[..n as usize]);
-                    let t = title.to_ascii_lowercase();
-                    t.contains("vlc")
+                    title.to_ascii_lowercase().contains(ctx.title_match)
                 }
             };
             if matches {
@@ -365,24 +398,95 @@ fn windows_focus_vlc(pid: Option<u32>) {
 
     let mut ctx = Ctx {
         pid,
+        title_match,
         found: Vec::new(),
     };
     unsafe {
         EnumWindows(enum_cb, &mut ctx as *mut Ctx as u64);
         for hwnd in ctx.found {
-            ShowWindow(hwnd, SW_RESTORE);
-            BringWindowToTop(hwnd);
+            force_foreground(hwnd);
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn force_foreground(hwnd: u64) {
+    const SW_RESTORE: i32 = 9;
+    const SW_SHOW: i32 = 5;
+    const HWND_TOPMOST: u64 = (-1i64) as u64;
+    const HWND_NOTOPMOST: u64 = (-2i64) as u64;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_SHOWWINDOW: u32 = 0x0040;
+
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+        if GetForegroundWindow() == hwnd {
+            return;
+        }
+        // A background daemon is denied foreground rights (taskbar only
+        // flashes). Borrowing the foreground thread's input rights for the
+        // duration of the call is the standard workaround.
+        let fg = GetForegroundWindow();
+        let attached = if fg != 0 {
+            let cur_thread = GetCurrentThreadId();
+            let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+            AttachThreadInput(cur_thread, fg_thread, 1)
+        } else {
+            0
+        };
+        BringWindowToTop(hwnd);
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+        SetFocus(hwnd);
+        if attached != 0 {
+            let cur_thread = GetCurrentThreadId();
+            let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+            AttachThreadInput(cur_thread, fg_thread, 0);
+        }
+        // Last resort: momentary TOPMOST pulls the window above everything,
+        // then drop it back so it doesn't stay pinned.
+        if GetForegroundWindow() != hwnd {
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
             SetForegroundWindow(hwnd);
         }
     }
 }
 
 #[cfg(not(windows))]
-fn unix_focus_vlc() {
+fn unix_focus_player(title_match: &str) {
     // Wayland/X11: try whatever raiser is installed. All best-effort.
+    let wm_name = if title_match == "mpv" { "mpv" } else { "VLC" };
     for (prog, args) in [
-        ("xdotool", vec!["search", "--onlyvisible", "--class", "vlc", "windowactivate", "windowraise"]),
-        ("wmctrl", vec!["-a", "VLC"]),
+        (
+            "xdotool",
+            vec![
+                "search",
+                "--onlyvisible",
+                "--class",
+                title_match,
+                "windowactivate",
+                "windowraise",
+            ],
+        ),
+        ("wmctrl", vec!["-a", wm_name]),
     ] {
         let _ = std::process::Command::new(prog)
             .args(&args)
@@ -429,6 +533,16 @@ mod tests {
         for name in ["wlo1", "wlan0", "eth0", "enp3s0", "tailscale0"] {
             assert!(!is_virtual_iface(name), "{}", name);
         }
+    }
+
+    #[test]
+    fn mpv_args_night_mode_toggles_filter() {
+        let on = mpv_args("ipc-test", true);
+        assert!(on.contains(&"--af=dynaudnorm".to_string()));
+        let off = mpv_args("ipc-test", false);
+        assert!(!off.contains(&"--af=dynaudnorm".to_string()));
+        // IPC channel is always present regardless.
+        assert!(off.contains(&"--input-ipc-server=ipc-test".to_string()));
     }
 
     #[test]

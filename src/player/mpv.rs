@@ -11,6 +11,7 @@ const TRANSITION_TIMEOUT: Duration = Duration::from_secs(35);
 pub struct MpvPlayer {
     child: Option<Child>,
     ipc_endpoint: String,
+    night_mode: bool,
     uri: String,
     title: String,
     loaded_uri: Option<String>,
@@ -27,10 +28,11 @@ pub struct MpvPlayer {
 }
 
 impl MpvPlayer {
-    pub fn new() -> Self {
+    pub fn new(night_mode: bool) -> Self {
         Self {
             child: None,
             ipc_endpoint: crate::platform::mpv_ipc_endpoint(),
+            night_mode,
             uri: String::new(),
             title: String::new(),
             loaded_uri: None,
@@ -80,7 +82,10 @@ impl MpvPlayer {
             None => return false,
         };
         let mut child = match Command::new(&mpv_path)
-            .args(crate::platform::mpv_args(&self.ipc_endpoint))
+            .args(crate::platform::mpv_args(
+                &self.ipc_endpoint,
+                self.night_mode,
+            ))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -191,6 +196,9 @@ impl MpvPlayer {
         self.state = PlaybackState::Transitioning;
         self.transition_start = Some(Instant::now());
         self.last_pos_time = Instant::now();
+        // Reused mpv instance may sit behind other windows.
+        let pid = self.child.as_ref().map(|c| c.id());
+        crate::platform::focus_mpv(pid);
     }
 
     fn restore_after_respawn(&mut self, resume_pos: Duration, was_paused: bool) {
@@ -740,7 +748,7 @@ mod tests {
     #[ignore]
     fn live_drive_play_pause_seek_reconnect() {
         let sample = std::env::var("MPV_SAMPLE").expect("set MPV_SAMPLE to a media file");
-        let mut p = MpvPlayer::new();
+        let mut p = MpvPlayer::new(true);
         p.set_uri(sample.clone(), "sample".to_string());
         p.play().expect("play");
         for _ in 0..20 {

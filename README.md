@@ -101,6 +101,8 @@ systemctl --user enable --now playpnp
 
 Player backend is chosen with `-p` / `--player` (`mpv`, `vlc`, or `auto` = mpv first, VLC fallback). Examples: `playpnp -p vlc serve`, `playpnp --player=mpv`.
 
+mpv plays with night mode on by default (loud music tamed, quiet dialogue lifted, TV-style). Turn it off with `--no-night-mode`.
+
 Extra peers can also live in `peers.txt` — `%APPDATA%\playpnp\peers.txt` on Windows, `~/.config/playpnp/peers.txt` on Linux (one IP per line). The dashboard can add peers at runtime too. Device identity (`uuid`) persists next to it.
 
 ---
