@@ -1,12 +1,12 @@
 use axum::{
     Router,
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use tokio::sync::watch;
 
@@ -62,6 +62,155 @@ fn purge_dead_subscriptions(subs: &Arc<RwLock<HashMap<String, Subscription>>>) {
             keep
         });
     }
+}
+
+/// Split a GENA CALLBACK header into individual URLs.
+/// BubbleUPnP concatenates as `<url1><url2>` (no comma), while the spec
+/// uses comma-separated `<url1>,<url2>`. Handle both.
+fn extract_callback_urls(raw: &str) -> Vec<String> {
+    let tmp = raw.trim().replace("><", ">\n<");
+    tmp.split([',', '\n'])
+        .map(|s| {
+            s.trim()
+                .trim_matches('<')
+                .trim_matches('>')
+                .trim()
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// IPv4 address inside a callback/media URL, if any.
+fn extract_ip_from_url(url: &str) -> Option<Ipv4Addr> {
+    let auth = url_authority(url);
+    let host = if let Some(rest) = auth.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        auth.split(':').next().unwrap_or(auth)
+    };
+    host.parse().ok()
+}
+
+/// Authority (host[:port]) of a URL, minus any userinfo.
+fn url_authority(url: &str) -> &str {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    host_port.rsplit('@').next().unwrap_or(host_port)
+}
+
+/// Tailscale CGNAT range (100.64/10, also used for carrier NAT) first:
+/// when the controller sits behind such an address it is usually the
+/// serving one (hotspot gateway forwards it even with no local tailnet).
+fn prefer_tailscale_ips(ips: &mut [Ipv4Addr]) {
+    ips.sort_by_key(|ip| !crate::config::is_tailscale_ip(ip));
+}
+
+/// Non-loopback callback URLs first; phone-loopback ones last.
+fn prefer_reachable_urls(urls: &mut [String]) {
+    urls.sort_by_key(|u| matches!(extract_ip_from_url(u), Some(ip) if ip.is_loopback()));
+}
+
+/// Split a media URL into (host, port); None when unparseable.
+fn uri_host_port(uri: &str) -> Option<(String, u16)> {
+    let host_port = url_authority(uri);
+    // IPv6 [::1]:port
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        let port = rest[end + 1..].strip_prefix(':')?.parse::<u16>().ok()?;
+        return Some((host.to_string(), port));
+    }
+    let mut parts = host_port.split(':');
+    let host = parts.next()?.to_string();
+    let port = parts.next()?.parse::<u16>().ok()?;
+    Some((host, port))
+}
+
+/// True for hosts that mean "this machine" and are never dialable remotely.
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    h == "127.0.0.1" || h == "localhost" || h == "::1" || h.starts_with("127.")
+}
+
+/// Probe whether host:port accepts TCP within timeout.
+async fn probe_host(host: &str, port: u16, timeout: std::time::Duration) -> bool {
+    let target = format!("{}:{}", host, port);
+    tokio::time::timeout(timeout, tokio::net::TcpStream::connect(target))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+}
+
+/// Repair a controller-advertised media URL that is unreachable from here
+/// (phone-loopback proxy, VPN-only address, wrong interface): verify the
+/// original first, else swap the host for a probed-reachable controller IP.
+/// First connect wins.
+async fn repair_media_uri(
+    uri: &str,
+    subs: &Arc<RwLock<HashMap<String, Subscription>>>,
+    sender: Option<Ipv4Addr>,
+) -> String {
+    let (host, port) = match uri_host_port(uri) {
+        Some(hp) => hp,
+        None => return uri.to_string(),
+    };
+    // Fast path: the advertised URL is directly reachable (the common case
+    // for server/internet URLs). One short probe, no behavior change.
+    if !is_loopback_host(&host) {
+        if probe_host(&host, port, std::time::Duration::from_millis(700)).await {
+            return uri.to_string();
+        }
+        tracing::warn!("Media URL host {}:{} unreachable, attempting repair", host, port);
+    }
+    // Candidate hosts: GENA callback IPs reveal where the controller really
+    // serves from; the SOAP sender just reached us so it is routable too.
+    // (get_tailscale_peers folds in registered peers, peers.txt and
+    // PLAYPNP_PEERS, but its 15s cache may lag this request.)
+    let mut candidates: Vec<Ipv4Addr> = Vec::new();
+    if let Ok(guard) = subs.read() {
+        for sub in guard.values() {
+            for url in extract_callback_urls(&sub.callback) {
+                if let Some(ip) = extract_ip_from_url(&url)
+                    && !ip.is_loopback() && !ip.is_unspecified() && !candidates.contains(&ip)
+                {
+                    candidates.push(ip);
+                }
+            }
+        }
+    }
+    if let Some(s) = sender
+        && !s.is_loopback() && !s.is_unspecified() && !candidates.contains(&s)
+    {
+        candidates.push(s);
+    }
+    for p in crate::config::get_tailscale_peers() {
+        if !candidates.contains(&p) {
+            candidates.push(p);
+        }
+    }
+    prefer_tailscale_ips(&mut candidates);
+    if candidates.is_empty() {
+        tracing::warn!("Media URL host {} unreachable with no candidate replacement", host);
+        return uri.to_string();
+    }
+    for ip in &candidates {
+        if probe_host(&ip.to_string(), port, std::time::Duration::from_millis(900)).await {
+            let fixed = uri.replacen(&host, &ip.to_string(), 1);
+            tracing::info!("Repaired media URL {} -> {} (via {:?})", uri, fixed, ip);
+            return fixed;
+        }
+    }
+    // Nothing probed open (phone may open the server on Play). Best effort:
+    // use the first candidate so mpv at least targets the phone, not ourselves.
+    let fallback = uri.replacen(&host, &candidates[0].to_string(), 1);
+    tracing::warn!(
+        "Media URL {}: no candidate port {} open, best-effort rewrite -> {}",
+        uri,
+        port,
+        fallback
+    );
+    fallback
 }
 
 fn transport_state_for_player(player_state: PlaybackState, has_media: bool) -> TransportState {
@@ -151,7 +300,10 @@ pub async fn run_http_server(
         .with_state(app_state_with_port);
 
     tokio::spawn(async move {
-        axum::serve(listener, app2)
+        axum::serve(
+            listener,
+            app2.into_make_service_with_connect_info::<SocketAddr>(),
+        )
             .with_graceful_shutdown(async move {
                 loop {
                     if *shutdown.borrow() {
@@ -468,11 +620,18 @@ async fn cm_scpd_handler() -> impl IntoResponse {
     )
 }
 
-async fn event_handler(State(state): State<AppState>, req: Request) -> Response {
+async fn event_handler(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
     let method = req.method().clone();
     let headers = req.headers().clone();
     let uri = req.uri().path().to_string();
     tracing::debug!("GENA {} {} headers={:?}", method, uri, headers);
+    if let IpAddr::V4(v4) = peer.ip() {
+        crate::config::register_peer(v4);
+    }
 
     // We need to handle SUBSCRIBE, UNSUBSCRIBE
     // Axum's Method may not have SUBSCRIBE constant, so we check string
@@ -538,12 +697,18 @@ async fn handle_subscribe(state: AppState, headers: HeaderMap, uri: String) -> R
     if callback.is_empty() {
         return (StatusCode::BAD_REQUEST, "Missing CALLBACK").into_response();
     }
-    // CALLBACK is like <http://192.168.1.10:1234/notify>
-    let callback_clean = callback
-        .trim()
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .to_string();
+    // BubbleUPnP concatenates callbacks as <url1><url2>; keep every URL —
+    // the non-loopback ones locate the controller's real servers.
+    let urls = extract_callback_urls(&callback);
+    for url in &urls {
+        if let Some(ip) = extract_ip_from_url(url)
+            && !ip.is_loopback() && !ip.is_unspecified()
+        {
+            crate::config::register_peer(ip);
+        }
+    }
+    // Store all URLs (comma-joined); send_notify tries each in turn.
+    let callback_clean = urls.join(",");
     let sid = format!("uuid:{}", uuid::Uuid::new_v4());
     let sub = Subscription {
         sid: sid.clone(),
@@ -638,6 +803,40 @@ fn parse_timeout(s: &str) -> u64 {
     1800
 }
 
+/// POST one GENA NOTIFY body to each callback URL in turn (reachable
+/// ones first); true when any delivery succeeds.
+async fn post_notify(
+    client: &reqwest::Client,
+    urls: &[String],
+    sid: &str,
+    seq: u32,
+    body: &str,
+) -> bool {
+    // reqwest doesn't have a NOTIFY method constant, use Method::from_bytes.
+    let method = reqwest::Method::from_bytes(b"NOTIFY").unwrap_or(reqwest::Method::POST);
+    for url in urls {
+        let res = client
+            .request(method.clone(), url)
+            .header(
+                "HOST",
+                url.replace("http://", "").split('/').next().unwrap_or(""),
+            )
+            .header("CONTENT-TYPE", "text/xml; charset=\"utf-8\"")
+            .header("NT", "upnp:event")
+            .header("NTS", "upnp:propchange")
+            .header("SID", sid)
+            .header("SEQ", seq.to_string())
+            .body(body.to_string())
+            .send()
+            .await;
+        if res.is_ok() {
+            tracing::debug!("NOTIFY delivered to {} SEQ {}", url, seq);
+            return true;
+        }
+    }
+    false
+}
+
 async fn send_notify(subs: &Arc<RwLock<HashMap<String, Subscription>>>, sid: &str, body: &str) {
     let (callback, seq) = {
         let mut guard = subs.write().unwrap();
@@ -657,46 +856,19 @@ async fn send_notify(subs: &Arc<RwLock<HashMap<String, Subscription>>>, sid: &st
         seq,
         body.len()
     );
-    // Use reqwest to send NOTIFY (custom method)
+    // Use reqwest to send NOTIFY (custom method). Try every callback URL
+    // (BubbleUPnP sends loopback + tailscale); reachable ones first.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build();
     if let Ok(client) = client {
-        // callback may be multiple URLs comma separated? For now take first.
-        let url = callback
-            .split(',')
-            .next()
-            .unwrap_or(&callback)
-            .trim()
-            .trim_matches('<')
-            .trim_matches('>')
-            .trim();
-        // reqwest doesn't have NOTIFY method constant, use Method::from_bytes
-        let method = reqwest::Method::from_bytes(b"NOTIFY").unwrap_or(reqwest::Method::POST);
-        let res = client
-            .request(method, url)
-            .header(
-                "HOST",
-                url.replace("http://", "").split('/').next().unwrap_or(""),
-            )
-            .header("CONTENT-TYPE", "text/xml; charset=\"utf-8\"")
-            .header("NT", "upnp:event")
-            .header("NTS", "upnp:propchange")
-            .header("SID", sid)
-            .header("SEQ", seq.to_string())
-            .body(body.to_string())
-            .send()
-            .await;
-        match res {
-            Ok(r) => {
-                tracing::debug!("NOTIFY response status {}", r.status());
-                note_notify_result(subs, sid, true);
-            }
-            Err(e) => {
-                tracing::warn!("NOTIFY failed to {}: {}", url, e);
-                note_notify_result(subs, sid, false);
-            }
+        let mut urls = extract_callback_urls(&callback);
+        prefer_reachable_urls(&mut urls);
+        let ok = post_notify(&client, &urls, sid, seq, body).await;
+        if !ok {
+            tracing::warn!("NOTIFY failed to {}: all urls refused", callback);
         }
+        note_notify_result(subs, sid, ok);
     }
 }
 
@@ -736,26 +908,10 @@ pub async fn notify_avtransport(state: &AppState) {
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
                 .unwrap();
-            let url = cb
-                .split(',')
-                .next()
-                .unwrap_or(&cb)
-                .trim()
-                .trim_matches('<')
-                .trim_matches('>')
-                .trim();
-            let method = reqwest::Method::from_bytes(b"NOTIFY").unwrap();
-            let res = client
-                .request(method, url)
-                .header("NT", "upnp:event")
-                .header("NTS", "upnp:propchange")
-                .header("SID", sid_clone.clone())
-                .header("SEQ", seq.to_string())
-                .header("CONTENT-TYPE", "text/xml; charset=\"utf-8\"")
-                .body(body_clone)
-                .send()
-                .await;
-            note_notify_result(&subs_clone, &sid_clone, res.is_ok());
+            let mut urls = extract_callback_urls(&cb);
+            prefer_reachable_urls(&mut urls);
+            let ok = post_notify(&client, &urls, &sid_clone, seq, &body_clone).await;
+            note_notify_result(&subs_clone, &sid_clone, ok);
         });
     }
 }
@@ -792,24 +948,19 @@ pub async fn notify_rendering(state: &AppState) {
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
                 .unwrap();
-            let url = cb.split(',').next().unwrap_or(&cb).trim();
-            let method = reqwest::Method::from_bytes(b"NOTIFY").unwrap();
-            let res = client
-                .request(method, url)
-                .header("NT", "upnp:event")
-                .header("NTS", "upnp:propchange")
-                .header("SID", sid_clone.clone())
-                .header("SEQ", seq.to_string())
-                .header("CONTENT-TYPE", "text/xml; charset=\"utf-8\"")
-                .body(body_clone)
-                .send()
-                .await;
-            note_notify_result(&subs_clone, &sid_clone, res.is_ok());
+            let mut urls = extract_callback_urls(&cb);
+            prefer_reachable_urls(&mut urls);
+            let ok = post_notify(&client, &urls, &sid_clone, seq, &body_clone).await;
+            note_notify_result(&subs_clone, &sid_clone, ok);
         });
     }
 }
 
-async fn control_handler(State(state): State<AppState>, req: Request) -> Response {
+async fn control_handler(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
     let headers = req.headers().clone();
     let uri_path = req.uri().path().to_string();
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
@@ -862,9 +1013,17 @@ async fn control_handler(State(state): State<AppState>, req: Request) -> Respons
     );
     tracing::debug!("SOAP body: {}", body_str);
 
+    let sender_v4 = match peer.ip() {
+        IpAddr::V4(v4) => {
+            crate::config::register_peer(v4);
+            Some(v4)
+        }
+        _ => None,
+    };
+
     // Route based on uri and action
     let result = if uri_path.contains("AVTransport") {
-        handle_avtransport(&state, &action, &body_str).await
+        handle_avtransport(&state, &action, &body_str, sender_v4).await
     } else if uri_path.contains("RenderingControl") {
         handle_rendering(&state, &action, &body_str).await
     } else if uri_path.contains("ConnectionManager") {
@@ -907,13 +1066,14 @@ async fn handle_avtransport(
     state: &AppState,
     action: &str,
     body: &str,
+    sender: Option<Ipv4Addr>,
 ) -> Result<String, (u32, String)> {
     match action {
         "SetAVTransportURI" => {
-            let uri = xml::extract_tag(body, "CurrentURI").unwrap_or_default();
-            let metadata = xml::extract_tag(body, "CurrentURIMetaData").unwrap_or_default();
-            let mut title = extract_title_from_didl(&metadata);
-            let artist = crate::state::extract_artist_from_didl(&metadata);
+            let raw_uri = xml::extract_tag(body, "CurrentURI").unwrap_or_default();
+            let raw_metadata = xml::extract_tag(body, "CurrentURIMetaData").unwrap_or_default();
+            let mut title = extract_title_from_didl(&raw_metadata);
+            let artist = crate::state::extract_artist_from_didl(&raw_metadata);
             if !artist.is_empty() {
                 if !title.is_empty() {
                     title = format!("{} - {}", artist, title);
@@ -921,15 +1081,30 @@ async fn handle_avtransport(
                     title = artist;
                 }
             }
-            if title.is_empty() {
-                if let Some(pos) = uri.rfind('/') {
-                    title = uri[pos + 1..].split('?').next().unwrap_or("Media").to_string();
-                }
+            if title.is_empty()
+                && let Some(pos) = raw_uri.rfind('/')
+            {
+                title = raw_uri[pos + 1..].split('?').next().unwrap_or("Media").to_string();
             }
-            tracing::info!("SetAVTransportURI uri={} title={} metadata_len={}", uri, title, metadata.len());
-            if uri.is_empty() {
+            if raw_uri.is_empty() {
                 return Err((402, "Invalid Args".into()));
             }
+            // Controller-advertised media URLs are not always reachable from
+            // here (phone-loopback proxy, VPN-only address, wrong interface);
+            // verify and repair to a reachable controller IP before handing to mpv.
+            let uri = repair_media_uri(&raw_uri, &state.subscriptions, sender).await;
+            // DIDL res elements carry the same host; keep them consistent
+            // with the repaired URI so GetMediaInfo stays truthful.
+            let metadata = match (uri_host_port(&raw_uri), uri_host_port(&uri)) {
+                (Some((old_host, _)), Some((new_host, _))) if old_host != new_host => {
+                    raw_metadata.replace(&old_host, &new_host)
+                }
+                _ => raw_metadata.clone(),
+            };
+            if uri != raw_uri {
+                tracing::info!("SetAVTransportURI repaired: {} -> {}", raw_uri, uri);
+            }
+            tracing::info!("SetAVTransportURI uri={} title={} metadata_len={}", uri, title, metadata.len());
             let duration_from_didl = crate::state::extract_duration_from_didl(&metadata);
             {
                 let mut av = state.av_state.write().unwrap();
@@ -1299,5 +1474,35 @@ mod tests {
             true,
             Duration::from_millis(400),
         ));
+    }
+
+    #[test]
+    fn splits_concatenated_callback_urls() {
+        let raw = "<http://127.0.0.1:58645/cb><http://100.67.144.166:58645/cb>";
+        let urls = extract_callback_urls(raw);
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].contains("127.0.0.1"));
+        assert!(urls[1].contains("100.67.144.166"));
+
+        let raw2 = "<http://192.168.1.10:1234/a>,<http://192.168.1.10:1235/b>";
+        assert_eq!(extract_callback_urls(raw2).len(), 2);
+    }
+
+    #[test]
+    fn detects_loopback_hosts() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.0.0.2"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("192.168.1.5"));
+        assert!(!is_loopback_host("100.67.144.166"));
+    }
+
+    #[test]
+    fn parses_uri_host_port() {
+        let (h, p) = uri_host_port("http://127.0.0.1:57645/b64/abc.mkv").unwrap();
+        assert_eq!(h, "127.0.0.1");
+        assert_eq!(p, 57645);
+        assert!(uri_host_port("not-a-url").is_none());
     }
 }
